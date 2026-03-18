@@ -123,7 +123,53 @@ CREATE VIRTUAL SCHEMA vector_schema
 
 ## Loading Data
 
-Since Exasol virtual schemas are read-only, data must be inserted directly into Qdrant. The adapter handles embedding automatically via Ollama.
+There are two ways to get data into Qdrant so you can query it via the virtual schema:
+
+### Option A — Ingestion via Exasol UDFs (recommended for Exasol-native data)
+
+If your source data already lives in Exasol tables, use the **`EMBED_AND_PUSH`** SET UDF
+to embed rows with Ollama and push them to Qdrant without leaving SQL.
+
+**No SLC or extra packages required** — the UDFs use Python's standard library only.
+
+```sql
+-- 1. Run scripts/create_udfs_ollama.sql in your SQL client to create the UDFs
+--    (only needed once)
+
+-- 2. Create the Qdrant collection (nomic-embed-text = 768 dimensions)
+SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
+    '172.17.0.1', 6333, '', 'my_collection', 768, 'Cosine', ''
+);
+
+-- 3. Embed and push rows from an Exasol table
+SELECT ADAPTER.EMBED_AND_PUSH(
+    id_col, text_col,
+    '172.17.0.1', 6333, '',
+    'my_collection',
+    'ollama',
+    'http://172.17.0.4:11434',  -- Ollama container IP (not localhost)
+    'nomic-embed-text'
+)
+FROM MY_SCHEMA.MY_TABLE
+GROUP BY IPROC();
+
+-- 4. Search
+ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+SELECT "ID", "TEXT", "SCORE"
+FROM vector_schema.my_collection
+WHERE "QUERY" = 'your search query here'
+LIMIT 10;
+```
+
+> **Docker networking:** the UDFs run inside the Exasol container. Use the Ollama
+> container IP (find it with `docker inspect ollama`) — not `localhost` or `172.17.0.1`.
+
+See [docs/udf-ingestion.md](docs/udf-ingestion.md) for the full guide including
+parameter reference, troubleshooting, and OpenAI provider usage.
+
+### Option B — Direct HTTP / PowerShell ingestion
+
+Since Exasol virtual schemas are read-only, data can also be inserted directly into Qdrant via its REST API. The adapter handles query-time embedding automatically via Ollama.
 
 Use the PowerShell helper below, or any HTTP client:
 
@@ -267,7 +313,7 @@ mvn verify -Pit
 
 See [docs/limitations.md](docs/limitations.md) for full details. Key points:
 
-- **Read-only virtual schema** — INSERT must go through Qdrant directly (or a companion script)
+- **Read-only virtual schema** — INSERT via the virtual schema is not supported; use the `EMBED_AND_PUSH` UDF (see [docs/udf-ingestion.md](docs/udf-ingestion.md)) or the direct HTTP approach below
 - **One embedding call per query** — Ollama is called synchronously at query time
 - **No UPDATE or DELETE** — re-insert with the same ID to overwrite (upsert behaviour)
 - **Model consistency** — changing `QDRANT_MODEL` does not re-embed existing data; recreate the collection
