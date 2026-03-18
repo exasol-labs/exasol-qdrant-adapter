@@ -1,4 +1,5 @@
 target/
+.claude/
 *.class
 *.jar
 !target/qdrant-virtual-schema-*-all.jar
