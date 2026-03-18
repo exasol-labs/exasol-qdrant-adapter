@@ -32,13 +32,13 @@ Ranked results back to Exasol
 
 ## Prerequisites
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| Exasol | 7.x+ | Docker or on-premise |
-| Qdrant | 1.9+ | Docker recommended |
-| Ollama | latest | Must have `nomic-embed-text` pulled |
-| Java | 21 | For building only |
-| Maven | 3.8+ | For building only |
+| Component | Version | Notes                               |
+| --------- | ------- | ----------------------------------- |
+| Exasol    | 7.x+    | Docker or on-premise                |
+| Qdrant    | 1.9+    | Docker recommended                  |
+| Ollama    | latest  | Must have `nomic-embed-text` pulled |
+| Java      | 21      | For building only                   |
+| Maven     | 3.8+    | For building only                   |
 
 ---
 
@@ -114,6 +114,7 @@ CREATE VIRTUAL SCHEMA vector_schema
 ```
 
 > **Docker networking note:** `host.docker.internal` does not resolve inside Exasol's UDF sandbox on Linux. Use the Docker bridge gateway IP instead. Find it with:
+>
 > ```bash
 > docker exec exasoldb ip route show default
 > # → default via 172.17.0.1 dev eth0
@@ -210,6 +211,12 @@ Add-Document "articles" "doc-3" "Neural networks are inspired by the human brain
 
 ---
 
+## Refresh Virtual Schema
+
+```sql
+ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+```
+
 ## Querying
 
 After refreshing the virtual schema, each Qdrant collection appears as a table.
@@ -235,12 +242,12 @@ ORDER BY s."SCORE" DESC;
 
 **Table columns:**
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `ID` | VARCHAR | Original document ID as inserted |
-| `TEXT` | VARCHAR | Original document text |
-| `SCORE` | DOUBLE | Cosine similarity (0–1, higher = more similar) |
-| `QUERY` | VARCHAR | The query string echoed back |
+| Column  | Type    | Description                                    |
+| ------- | ------- | ---------------------------------------------- |
+| `ID`    | VARCHAR | Original document ID as inserted               |
+| `TEXT`  | VARCHAR | Original document text                         |
+| `SCORE` | DOUBLE  | Cosine similarity (0–1, higher = more similar) |
+| `QUERY` | VARCHAR | The query string echoed back                   |
 
 > Always quote column names with double quotes (`"QUERY"`) to avoid conflicts with Exasol reserved keywords.
 
@@ -248,12 +255,12 @@ ORDER BY s."SCORE" DESC;
 
 ## Virtual Schema Properties
 
-| Property | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `CONNECTION_NAME` | Yes | — | Exasol CONNECTION object with Qdrant URL |
-| `QDRANT_MODEL` | Yes | — | Ollama model name for embeddings |
-| `OLLAMA_URL` | No | `http://localhost:11434` | Ollama base URL reachable from Exasol |
-| `QDRANT_URL` | No | — | Override Qdrant URL (ignores CONNECTION address) |
+| Property          | Required | Default                  | Description                                      |
+| ----------------- | -------- | ------------------------ | ------------------------------------------------ |
+| `CONNECTION_NAME` | Yes      | —                        | Exasol CONNECTION object with Qdrant URL         |
+| `QDRANT_MODEL`    | Yes      | —                        | Ollama model name for embeddings                 |
+| `OLLAMA_URL`      | No       | `http://localhost:11434` | Ollama base URL reachable from Exasol            |
+| `QDRANT_URL`      | No       | —                        | Override Qdrant URL (ignores CONNECTION address) |
 
 Change properties without dropping the schema:
 
