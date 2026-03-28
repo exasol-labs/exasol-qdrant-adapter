@@ -15,7 +15,7 @@ LIMIT 5;
 ```
 Exasol SQL query
       ↓
-Virtual Schema Adapter (Java, runs in Exasol)
+Virtual Schema Adapter (Lua, runs inside Exasol — no BucketFS, no JAR)
       ↓
 Ollama (local embeddings — text → float vector)
       ↓
@@ -27,6 +27,7 @@ Ranked results back to Exasol
 - No pre-computed embeddings needed — the adapter calls Ollama automatically at query time
 - Results are ranked by cosine similarity score (0–1, higher = more similar)
 - Works with any Ollama embedding model (default: `nomic-embed-text`)
+- Deployed as a single SQL statement — no Maven build, no BucketFS upload
 
 ---
 
@@ -37,8 +38,14 @@ Ranked results back to Exasol
 | Exasol    | 7.x+    | Docker or on-premise                |
 | Qdrant    | 1.9+    | Docker recommended                  |
 | Ollama    | latest  | Must have `nomic-embed-text` pulled |
-| Java      | 21      | For building only                   |
-| Maven     | 3.8+    | For building only                   |
+
+**Dev-only** (only needed to rebuild `dist/adapter.lua` after source changes):
+
+| Tool       | Install                       |
+| ---------- | ----------------------------- |
+| Lua 5.4    | `brew install lua` / apt      |
+| lua-amalg  | `luarocks install amalg`      |
+| virtual-schema-common-lua | `luarocks install virtual-schema-common-lua` |
 
 ---
 
@@ -57,31 +64,7 @@ docker run -d --name ollama -p 11434:11434 ollama/ollama
 docker exec ollama ollama pull nomic-embed-text
 ```
 
-### 3. Build the adapter JAR
-
-```bash
-mvn clean package -DskipTests
-# Output: target/qdrant-virtual-schema-0.1.0-all.jar
-```
-
-### 4. Deploy the JAR to Exasol BucketFS
-
-If Exasol is running in Docker, copy the JAR directly into the BucketFS destination directory:
-
-```bash
-docker exec exasoldb mkdir -p /exa/data/bucketfs/bfsdefault/.dest/default/adapter
-docker cp target/qdrant-virtual-schema-0.1.0-all.jar \
-  exasoldb:/exa/data/bucketfs/bfsdefault/.dest/default/adapter/qdrant-virtual-schema-0.1.0-all.jar
-```
-
-If you have BucketFS HTTPS access (port 2581), you can also upload via HTTP:
-
-```bash
-curl -k -X PUT -T target/qdrant-virtual-schema-0.1.0-all.jar \
-  https://w:<write-password>@<exasol-host>:2581/default/adapter/qdrant-virtual-schema-0.1.0-all.jar
-```
-
-### 5. Create SQL objects in Exasol
+### 3. Install the adapter in Exasol (one SQL statement)
 
 Run these statements in your SQL client (DBeaver, DBvisualizer, etc.):
 
@@ -97,10 +80,9 @@ CREATE OR REPLACE CONNECTION qdrant_conn
   USER ''
   IDENTIFIED BY '';
 
--- Adapter script (note: JAVA ADAPTER SCRIPT, not SET SCRIPT)
-CREATE OR REPLACE JAVA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
-  %scriptclass com.exasol.adapter.RequestDispatcher;
-  %jar /buckets/bfsdefault/default/adapter/qdrant-virtual-schema-0.1.0-all.jar;
+-- Adapter script — paste the contents of dist/adapter.lua between AS and /
+CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
+  -- <paste contents of dist/adapter.lua here>
 /
 
 -- Virtual schema
@@ -112,6 +94,8 @@ CREATE VIRTUAL SCHEMA vector_schema
        QDRANT_MODEL    = 'nomic-embed-text'
        OLLAMA_URL      = 'http://172.17.0.1:11434';
 ```
+
+> **No BucketFS, no JAR, no Maven.** The entire adapter is the single file `dist/adapter.lua`.
 
 > **Docker networking note:** `host.docker.internal` does not resolve inside Exasol's UDF sandbox on Linux. Use the Docker bridge gateway IP instead. Find it with:
 >
@@ -274,53 +258,51 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 ## Project Structure
 
 ```
-src/
-├── main/java/com/exasol/adapter/qdrant/
-│   ├── VectorSchemaAdapter.java        # Main adapter (push-down routing)
-│   ├── VectorSchemaAdapterFactory.java # Service loader entry point
-│   ├── AdapterProperties.java          # Property constants and validation
-│   ├── CredentialResolver.java         # Reads URL + API key from CONNECTION object
-│   ├── client/
-│   │   ├── QdrantClient.java           # Qdrant REST API client
-│   │   ├── OllamaEmbeddingClient.java  # Ollama embeddings client
-│   │   ├── QdrantException.java        # Qdrant error wrapper
-│   │   └── model/
-│   │       ├── Point.java              # Qdrant point (id, originalId, text)
-│   │       └── SearchResult.java       # Search result (id, text, score)
-│   ├── handler/
-│   │   ├── SelectHandler.java          # Handles SELECT similarity search
-│   │   ├── InsertHandler.java          # Handles INSERT (embedding + upsert)
-│   │   └── CreateCollectionHandler.java # Handles collection creation
-│   └── util/
-│       └── IdMapper.java               # VARCHAR → UUID v5 mapping
+src/lua/
+├── entry.lua                    # Global adapter_call() entrypoint — no business logic
+├── adapter/
+│   ├── QdrantAdapter.lua        # Adapter lifecycle (create, refresh, setProperties, pushDown)
+│   ├── AdapterProperties.lua    # Property constants, validation, merge semantics
+│   ├── capabilities.lua         # Capability set declaration
+│   ├── MetadataReader.lua       # HTTP GET /collections → table metadata
+│   └── QueryRewriter.lua        # Ollama embed + Qdrant search + VALUES SQL builder
+└── util/
+    └── http.lua                 # LuaSocket JSON GET/POST wrapper
+dist/
+└── adapter.lua                  # Single-file bundle (output of lua-amalg — deploy this)
+build/
+└── amalg.lua                    # Build script: lua build/amalg.lua → regenerates dist/
+exasol_udfs/                     # Python UDFs (EMBED_AND_PUSH, CREATE_QDRANT_COLLECTION)
 docs/
-├── deployment.md   # Detailed deployment steps
-├── usage-guide.md  # SQL usage examples
-└── limitations.md  # Known limitations
+├── lua-port/
+│   └── limitations.md           # Known Lua adapter limitations (TLS caveat etc.)
+└── ...
 ```
 
 ---
 
 ## Building
 
+The adapter ships as `dist/adapter.lua` — a single file bundled by `lua-amalg`.
+You only need to rebuild when modifying `src/lua/` source files.
+
 ```bash
-# Build fat JAR (includes all dependencies)
-mvn clean package -DskipTests
+# Install dev dependencies (once)
+luarocks install amalg
+luarocks install virtual-schema-common-lua
 
-# Run unit tests
-mvn test
-
-# Run integration tests (requires Qdrant on localhost:6333)
-mvn verify -Pit
+# Rebuild dist/adapter.lua
+lua build/amalg.lua
 ```
 
 ---
 
 ## Limitations
 
-See [docs/limitations.md](docs/limitations.md) for full details. Key points:
+See [docs/lua-port/limitations.md](docs/lua-port/limitations.md) for full details. Key points:
 
 - **Read-only virtual schema** — INSERT via the virtual schema is not supported; use the `EMBED_AND_PUSH` UDF (see [docs/udf-ingestion.md](docs/udf-ingestion.md)) or the direct HTTP approach below
+- **HTTP or public CA TLS only** — the Lua adapter cannot load custom CA certificates; self-signed TLS on Qdrant/Ollama is not supported
 - **One embedding call per query** — Ollama is called synchronously at query time
 - **No UPDATE or DELETE** — re-insert with the same ID to overwrite (upsert behaviour)
 - **Model consistency** — changing `QDRANT_MODEL` does not re-embed existing data; recreate the collection
