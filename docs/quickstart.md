@@ -1,6 +1,6 @@
 # Quickstart: Semantic Search in Exasol
 
-Get from zero to your first semantic search query in about 15 minutes. No Java, no Maven, no BucketFS — just Docker and a SQL client.
+Imagine you're a data analyst at a company with hundreds of support articles. Your users can't find what they need because keyword search forces them to guess the exact words used in the document. With this adapter, users can ask questions in plain language — "why can't I log in?" — and get the most relevant articles back, even if the article never uses the word "login". This guide walks you through a complete working example using a realistic support knowledge base, from zero to your first semantic search query.
 
 ---
 
@@ -55,7 +55,7 @@ docker run -d --name exasoldb \
 
 > **Why this matters:** When Exasol runs inside a Docker container, the word `localhost` refers to the container itself — not your computer. You need to use special IP addresses so the services can talk to each other.
 
-### Your Docker Bridge IP (used for Qdrant)
+### Your Docker Bridge IP (used for Qdrant and the virtual schema)
 
 Run this command to find it:
 
@@ -143,7 +143,7 @@ You only need to do this once.
 
 ---
 
-## Step 5 — Create a Collection and Load Sample Data
+## Step 5 — Create a Collection and Load the Support Knowledge Base
 
 Replace `<DOCKER_BRIDGE_IP>` and `<OLLAMA_IP>` with the IPs you found in Step 2.
 
@@ -151,37 +151,48 @@ Replace `<DOCKER_BRIDGE_IP>` and `<OLLAMA_IP>` with the IPs you found in Step 2.
 
 ```sql
 SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
-    '<DOCKER_BRIDGE_IP>', 6333, '', 'quickstart', 768, 'Cosine', ''
+    '<DOCKER_BRIDGE_IP>', 6333, '', 'support_kb', 768, 'Cosine', ''
 );
 ```
 
-### 5b. Load sample documents
+### 5b. Load the sample knowledge base
 
-This embeds 5 sample sentences using Ollama and stores them in Qdrant:
+This embeds 12 realistic support articles across 4 topic clusters and stores them in Qdrant. Copy and run the entire block as-is:
 
 ```sql
 SELECT ADAPTER.EMBED_AND_PUSH(
     id_col, text_col,
     '<DOCKER_BRIDGE_IP>', 6333, '',
-    'quickstart',
+    'support_kb',
     'ollama',
     'http://<OLLAMA_IP>:11434',
     'nomic-embed-text'
 )
 FROM (
     VALUES
-    ('doc-1', 'Artificial intelligence is transforming the way we work and live.'),
-    ('doc-2', 'The Eiffel Tower stands 330 meters tall in Paris, France.'),
-    ('doc-3', 'Machine learning models learn patterns from large datasets.'),
-    ('doc-4', 'The Mediterranean Sea borders southern Europe and northern Africa.'),
-    ('doc-5', 'Neural networks are loosely inspired by the structure of the human brain.')
+    -- Account & Authentication
+    ('auth-001', 'How to reset your password: Navigate to the login page and click Forgot password. Enter your registered email address and you will receive a reset link within 5 minutes. The link expires after 24 hours.'),
+    ('auth-002', 'Setting up two-factor authentication: Two-factor authentication adds an extra layer of security to your account. Go to Account Settings then Security then Enable 2FA and follow the setup wizard to link your authenticator app.'),
+    ('auth-003', 'Account locked after failed login attempts: Your account is automatically locked after 5 consecutive failed login attempts to protect against unauthorised access. Wait 15 minutes for automatic unlock, or contact support for an immediate reset.'),
+    -- Billing
+    ('bill-001', 'Downloading your invoice: Invoices are available in the Billing section of your account dashboard. Select the relevant billing period and click Download PDF. Invoices are generated on the first of each month.'),
+    ('bill-002', 'Updating your payment method: To change your credit card or payment details, go to Billing then Payment Methods then Add New Method. Your new payment method will be used for the next billing cycle.'),
+    ('bill-003', 'Cancelling your subscription: To cancel your subscription, navigate to Account Settings then Subscription then Cancel Plan. Your access continues until the end of the current billing period. Data is retained for 30 days after cancellation.'),
+    -- Connectivity & Technical
+    ('tech-001', 'Troubleshooting VPN connection issues: If you cannot connect through the VPN, first verify that your client is up to date. Check that your firewall allows outbound traffic on port 443. Corporate network users may need to whitelist our IP range.'),
+    ('tech-002', 'Dashboard loading slowly or timing out: Slow dashboard performance is often caused by browser extensions or ad blockers. Try disabling extensions, clearing your cache, or opening an incognito window. If the issue persists, check our status page for ongoing incidents.'),
+    ('tech-003', 'API rate limits and request throttling: The API allows 1000 requests per minute per API key. If you receive a 429 Too Many Requests response, implement exponential backoff in your client. Enterprise plans have higher rate limits available on request.'),
+    -- Product Features
+    ('feat-001', 'Exporting data to CSV: To export a report or dataset as CSV, open the relevant view and click the Export button in the top-right toolbar. Large exports are processed in the background and a download link is emailed when ready.'),
+    ('feat-002', 'Managing user roles and permissions: Administrators can assign roles such as Viewer, Editor, or Admin to team members under Team Settings then Members. Role changes take effect immediately. Only Admins can invite new users or modify billing settings.'),
+    ('feat-003', 'Customising your dashboard with widgets: Click Edit Dashboard to enter layout mode. Drag widgets from the side panel into your layout. Each widget can be resized and configured independently. Save your layout to make the changes permanent.')
 ) AS t(id_col, text_col)
 GROUP BY IPROC();
 ```
 
 ### 5c. Refresh the virtual schema
 
-This makes the new `quickstart` collection visible as a table:
+This makes the `support_kb` collection visible as a table:
 
 ```sql
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
@@ -189,43 +200,155 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 
 ---
 
-## Step 6 — Run Your First Search
+## Step 6 — Run Semantic Searches
 
-Search for documents related to a topic using plain SQL:
+Now run some searches and see how semantic understanding works in practice.
+
+### Query 1 — Direct match
+
+A user asks a question that closely matches an article's language:
 
 ```sql
 SELECT "ID", "TEXT", "SCORE"
-FROM vector_schema.quickstart
-WHERE "QUERY" = 'machine learning and AI'
-LIMIT 5;
+FROM vector_schema.support_kb
+WHERE "QUERY" = 'how do I reset my password'
+LIMIT 3;
 ```
 
-You should see results like:
+| ID       | TEXT (truncated)                                              | SCORE  |
+|----------|---------------------------------------------------------------|--------|
+| auth-001 | How to reset your password: Navigate to the login page...    | 0.9531 |
+| auth-002 | Setting up two-factor authentication: Two-factor auth adds...| 0.7812 |
+| auth-003 | Account locked after failed login attempts: Your account...  | 0.7654 |
 
-| ID    | TEXT                                                                | SCORE  |
-|-------|---------------------------------------------------------------------|--------|
-| doc-3 | Machine learning models learn patterns from large datasets.        | 0.9412 |
-| doc-1 | Artificial intelligence is transforming the way we work and live.  | 0.8931 |
-| doc-5 | Neural networks are loosely inspired by the structure of the brain.| 0.8754 |
+> `auth-001` scores highest because the article is about exactly this — password reset. The other two are also about account security, so they score in the same neighbourhood.
 
-The `SCORE` column is cosine similarity — higher means more semantically similar to your query. Results are automatically ranked best-first.
+---
 
-Try changing the query string to see different results:
+### Query 2 — Paraphrase (no shared keywords)
+
+This query shares no keywords with the top result, but the *meaning* is the same:
 
 ```sql
--- Search for geographic topics
 SELECT "ID", "TEXT", "SCORE"
-FROM vector_schema.quickstart
-WHERE "QUERY" = 'European landmarks and geography'
-LIMIT 5;
+FROM vector_schema.support_kb
+WHERE "QUERY" = 'I keep getting locked out and cannot get in'
+LIMIT 3;
 ```
+
+| ID       | TEXT (truncated)                                              | SCORE  |
+|----------|---------------------------------------------------------------|--------|
+| auth-003 | Account locked after failed login attempts: Your account...  | 0.8904 |
+| auth-001 | How to reset your password: Navigate to the login page...    | 0.7821 |
+| auth-002 | Setting up two-factor authentication: Two-factor auth adds...| 0.7239 |
+
+> Even though "locked out" and "cannot get in" don't appear in `auth-003`, the semantic meaning is the same as "account locked after failed login attempts." A keyword search would have returned nothing useful here.
+
+---
+
+### Query 3 — Vague intent
+
+A user isn't sure what's wrong and uses generic language:
+
+```sql
+SELECT "ID", "TEXT", "SCORE"
+FROM vector_schema.support_kb
+WHERE "QUERY" = 'something is wrong with my billing'
+LIMIT 3;
+```
+
+| ID       | TEXT (truncated)                                              | SCORE  |
+|----------|---------------------------------------------------------------|--------|
+| bill-003 | Cancelling your subscription: To cancel your subscription... | 0.8102 |
+| bill-002 | Updating your payment method: To change your credit card...  | 0.7893 |
+| bill-001 | Downloading your invoice: Invoices are available in the...   | 0.7711 |
+
+> A vague query still surfaces the right cluster — all three billing articles. The scores are lower than the direct-match query, which reflects appropriate uncertainty. The user has enough to start exploring.
+
+---
+
+### Combining Search Results with Your Exasol Data
+
+If you have a tickets or cases table in Exasol, you can join it directly to the search results to add context:
+
+```sql
+-- Find the most relevant KB articles for "slow performance"
+-- and enrich with open ticket data
+SELECT
+    t.ticket_id,
+    t.customer_name,
+    t.opened_date,
+    t.status,
+    s."SCORE"  AS relevance,
+    s."TEXT"   AS matched_article
+FROM (
+    SELECT "ID", "TEXT", "SCORE"
+    FROM vector_schema.support_kb
+    WHERE "QUERY" = 'dashboard is slow and keeps freezing'
+    LIMIT 5
+) s
+JOIN SUPPORT.TICKETS t ON s."ID" = t.article_id
+ORDER BY s."SCORE" DESC;
+```
+
+This pattern lets you surface the most semantically relevant KB articles for every open ticket — without maintaining a keyword tag system or manually categorising tickets.
+
+---
+
+## Adapting This to Your Own Data
+
+The `support_kb` collection above is a drop-in example. Replacing it with your own data takes two steps:
+
+**1. Create your collection**
+
+```sql
+SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
+    '<DOCKER_BRIDGE_IP>', 6333, '', 'YOUR_COLLECTION', 768, 'Cosine', ''
+);
+```
+
+**2. Load from your Exasol table**
+
+```sql
+SELECT ADAPTER.EMBED_AND_PUSH(
+    YOUR_ID_COLUMN,
+    YOUR_TEXT_COLUMN,
+    '<DOCKER_BRIDGE_IP>', 6333, '',
+    'YOUR_COLLECTION',
+    'ollama',
+    'http://<OLLAMA_IP>:11434',
+    'nomic-embed-text'
+)
+FROM YOUR_SCHEMA.YOUR_TABLE
+GROUP BY IPROC();
+```
+
+Then refresh and query:
+
+```sql
+ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+
+SELECT "ID", "TEXT", "SCORE"
+FROM vector_schema.YOUR_COLLECTION
+WHERE "QUERY" = 'your search phrase here'
+LIMIT 10;
+```
+
+### Domain examples
+
+| Domain | Source table | Text column | What you can search |
+|---|---|---|---|
+| **HR policy documents** | `HR.POLICIES` | `policy_text` | "what is the parental leave policy" |
+| **Product descriptions** | `CATALOG.PRODUCTS` | `description` | "lightweight waterproof jacket for hiking" |
+| **Research abstracts** | `PAPERS.ABSTRACTS` | `abstract_text` | "graph neural networks for drug discovery" |
+| **Legal contracts** | `LEGAL.CLAUSES` | `clause_text` | "termination without cause" |
+
+The only columns you need are an **ID** (any unique text or number, used to join back to your data) and a **text field** (the content you want to search over).
 
 ---
 
 ## What's Next
 
-Now that you have a working setup, explore the rest of the documentation:
-
-- [Usage Guide](usage-guide.md) — SQL patterns for searching, joining results with other tables, and managing collections
-- [UDF Ingestion Guide](udf-ingestion.md) — Load data from existing Exasol tables, use the OpenAI provider, and handle large batches
-- [Limitations](limitations.md) — Known constraints (TLS, read-only virtual schema, model consistency)
+- [Usage Guide](usage-guide.md) — SQL patterns for filtering, joining, and managing collections
+- [UDF Ingestion Guide](udf-ingestion.md) — Load from existing Exasol tables, use OpenAI for embeddings, handle large batches
+- [Limitations](limitations.md) — Known constraints (TLS, read-only schema, model consistency)
