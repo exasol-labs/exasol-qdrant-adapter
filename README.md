@@ -2,6 +2,8 @@
 
 A Virtual Schema adapter that brings semantic similarity search into Exasol SQL using [Qdrant](https://qdrant.tech/) as the vector store and [Ollama](https://ollama.com/) for local text embeddings.
 
+**New here? Start with the [Quickstart Guide](docs/quickstart.md) — Docker only, no build required, first query in ~15 minutes.**
+
 ```sql
 -- Find the most semantically similar documents — pure SQL
 SELECT "ID", "TEXT", "SCORE"
