@@ -65,7 +65,7 @@ local function esc(s) return (s or ""):gsub("'", "''") end
 
 local function rewrite(req, props)
     local url, key = resolve(props)
-    local ollama = (props.OLLAMA_URL and props.OLLAMA_URL ~= "") and props.OLLAMA_URL or "http://172.17.0.1:11435"
+    local ollama = (props.OLLAMA_URL and props.OLLAMA_URL ~= "") and props.OLLAMA_URL or "http://localhost:11434"
     local pdr = req.pushdownRequest or {}
     local col = (((req.involvedTables or {})[1]) or {}).name
     assert(col, "no involved table in involvedTables")

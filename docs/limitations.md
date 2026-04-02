@@ -49,6 +49,8 @@ WHERE query = '<search string>'
 [LIMIT k]
 ```
 
+> **Default limit:** When `LIMIT` is omitted, the adapter returns at most **10 results**. Always specify an explicit `LIMIT` clause if you need more (or fewer) rows.
+
 Unsupported patterns (will not push down correctly):
 
 - Joins between a vector table and another virtual schema table

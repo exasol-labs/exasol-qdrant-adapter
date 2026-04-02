@@ -2,8 +2,6 @@
 
 A Virtual Schema adapter that brings semantic similarity search into Exasol SQL using [Qdrant](https://qdrant.tech/) as the vector store and [Ollama](https://ollama.com/) for local text embeddings.
 
-**New here? Start with the [Quickstart Guide](docs/quickstart.md) — Docker only, no build required, first query in ~15 minutes.**
-
 ```sql
 -- Find the most semantically similar documents — pure SQL
 SELECT "ID", "TEXT", "SCORE"
@@ -119,6 +117,13 @@ to embed rows with Ollama and push them to Qdrant without leaving SQL.
 
 **No SLC or extra packages required** — the UDFs use Python's standard library only.
 
+The UDF takes two columns from your table:
+
+- **`id_col`** — A unique identifier for each row (e.g. a primary key or row number). This is stored as `_original_id` in Qdrant and returned as the `"ID"` column in search results, so you can join back to your source table.
+- **`text_col`** — The text to embed and search against. This is the content that gets converted into a vector by Ollama. For best results, concatenate multiple columns into a descriptive sentence rather than using a single field. For example, if your table has `name`, `city`, and `date` columns, combine them: `"name" || ' in ' || "city" || '. Date: ' || CAST("date" AS VARCHAR(10))`.
+
+Both must be `VARCHAR` — cast numeric or date columns with `CAST(... AS VARCHAR(...))`.
+
 ```sql
 -- 1. Run scripts/create_udfs_ollama.sql in your SQL client to create the UDFs
 --    (only needed once)
@@ -129,13 +134,15 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 );
 
 -- 3. Embed and push rows from an Exasol table
+--    Replace id_col and text_col with columns from YOUR table
 SELECT ADAPTER.EMBED_AND_PUSH(
-    id_col, text_col,
-    '172.17.0.1', 6333, '',
-    'my_collection',
-    'ollama',
-    'http://172.17.0.4:11434',  -- Ollama container IP (not localhost)
-    'nomic-embed-text'
+    CAST(id_col AS VARCHAR(36)),
+    text_col,                       -- or a concatenation of columns (see above)
+    '172.17.0.1', 6333, '',        -- Qdrant host, port, API key
+    'my_collection',                -- Qdrant collection name
+    'ollama',                       -- embedding provider
+    'http://172.17.0.4:11434',      -- Ollama container IP (not localhost)
+    'nomic-embed-text'              -- Ollama model name
 )
 FROM MY_SCHEMA.MY_TABLE
 GROUP BY IPROC();
@@ -236,6 +243,8 @@ ORDER BY s."SCORE" DESC;
 | `QUERY` | VARCHAR | The query string echoed back                   |
 
 > Always quote column names with double quotes (`"QUERY"`) to avoid conflicts with Exasol reserved keywords.
+>
+> **Default limit:** When no `LIMIT` clause is specified, results are capped at **10 rows**. Always include an explicit `LIMIT` to control how many results you get back.
 
 ---
 

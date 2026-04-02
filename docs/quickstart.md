@@ -309,10 +309,17 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 
 **2. Load from your Exasol table**
 
+The UDF takes two columns from your table:
+
+- **`YOUR_ID_COLUMN`** -- A unique identifier for each row (e.g. a primary key or row number). This is stored as `_original_id` in Qdrant and returned as the `"ID"` column in search results, so you can join back to your source table.
+- **`YOUR_TEXT_COLUMN`** -- The text to embed and search against. This is the content that gets converted into a vector by Ollama. For best results, concatenate multiple columns into a descriptive sentence rather than using a single field (see example below).
+
+Both must be `VARCHAR` -- cast numeric or date columns with `CAST(... AS VARCHAR(...))`.
+
 ```sql
 SELECT ADAPTER.EMBED_AND_PUSH(
-    YOUR_ID_COLUMN,
-    YOUR_TEXT_COLUMN,
+    CAST(YOUR_ID_COLUMN AS VARCHAR(36)),
+    YOUR_TEXT_COLUMN,                    -- or a concatenation (see below)
     '<DOCKER_BRIDGE_IP>', 6333, '',
     'YOUR_COLLECTION',
     'ollama',
@@ -320,6 +327,22 @@ SELECT ADAPTER.EMBED_AND_PUSH(
     'nomic-embed-text'
 )
 FROM YOUR_SCHEMA.YOUR_TABLE
+GROUP BY IPROC();
+```
+
+**Concatenation example:** If your table has `name`, `city`, and `date` columns, combine them into a richer text for better search quality:
+
+```sql
+SELECT ADAPTER.EMBED_AND_PUSH(
+    CAST("id" AS VARCHAR(36)),
+    "name" || ' in ' || "city" || '. Date: ' || CAST("date" AS VARCHAR(10)),
+    '<DOCKER_BRIDGE_IP>', 6333, '',
+    'events',
+    'ollama',
+    'http://<OLLAMA_IP>:11434',
+    'nomic-embed-text'
+)
+FROM MY_SCHEMA.EVENTS
 GROUP BY IPROC();
 ```
 
@@ -336,12 +359,12 @@ LIMIT 10;
 
 ### Domain examples
 
-| Domain | Source table | Text column | What you can search |
-|---|---|---|---|
-| **HR policy documents** | `HR.POLICIES` | `policy_text` | "what is the parental leave policy" |
-| **Product descriptions** | `CATALOG.PRODUCTS` | `description` | "lightweight waterproof jacket for hiking" |
-| **Research abstracts** | `PAPERS.ABSTRACTS` | `abstract_text` | "graph neural networks for drug discovery" |
-| **Legal contracts** | `LEGAL.CLAUSES` | `clause_text` | "termination without cause" |
+| Domain | Source table | ID column | Text column | What you can search |
+|---|---|---|---|---|
+| **HR policy documents** | `HR.POLICIES` | `policy_id` | `policy_text` | "what is the parental leave policy" |
+| **Product descriptions** | `CATALOG.PRODUCTS` | `product_id` | `description` | "lightweight waterproof jacket for hiking" |
+| **Research abstracts** | `PAPERS.ABSTRACTS` | `paper_id` | `abstract_text` | "graph neural networks for drug discovery" |
+| **Legal contracts** | `LEGAL.CLAUSES` | `clause_id` | `clause_text` | "termination without cause" |
 
 The only columns you need are an **ID** (any unique text or number, used to join back to your data) and a **text field** (the content you want to search over).
 
