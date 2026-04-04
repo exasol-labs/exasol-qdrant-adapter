@@ -64,38 +64,23 @@ docker run -d --name ollama -p 11434:11434 ollama/ollama
 docker exec ollama ollama pull nomic-embed-text
 ```
 
-### 3. Install the adapter in Exasol (one SQL statement)
+### 3. Install everything in Exasol (one file)
 
-Run these statements in your SQL client (DBeaver, DBvisualizer, etc.):
+Open [`scripts/install_all.sql`](scripts/install_all.sql) in your SQL client (DBeaver, DbVisualizer, etc.). Update the IPs in the `CONFIGURATION` section if needed, then run the entire file. It deploys:
 
-```sql
--- Schema for the adapter script
-CREATE SCHEMA IF NOT EXISTS ADAPTER;
+- Schema, connection, Lua adapter script
+- Python UDFs for data ingestion (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH`)
+- Virtual schema ready for queries
 
--- Connection object pointing to Qdrant
--- Replace the IP with your Qdrant host
--- If Exasol runs in Docker, use the Docker bridge gateway IP (typically 172.17.0.1)
-CREATE OR REPLACE CONNECTION qdrant_conn
-  TO 'http://172.17.0.1:6333'
-  USER ''
-  IDENTIFIED BY '';
-
--- Adapter script — paste the contents of dist/adapter.lua between AS and /
-CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
-  -- <paste contents of dist/adapter.lua here>
-/
-
--- Virtual schema
--- OLLAMA_URL: where Ollama is reachable from inside the Exasol container
--- QDRANT_MODEL: the Ollama model name used for embeddings
-CREATE VIRTUAL SCHEMA vector_schema
-  USING ADAPTER.VECTOR_SCHEMA_ADAPTER
-  WITH CONNECTION_NAME = 'qdrant_conn'
-       QDRANT_MODEL    = 'nomic-embed-text'
-       OLLAMA_URL      = 'http://172.17.0.1:11434';
+```bash
+# Default config values (change if your setup differs):
+#   Qdrant:  http://172.17.0.1:6333
+#   Ollama:  http://172.17.0.1:11434
+#   Model:   nomic-embed-text
+#   Schema:  ADAPTER
 ```
 
-> **No BucketFS, no JAR, no Maven.** The entire adapter is the single file `dist/adapter.lua`.
+> **No BucketFS, no JAR, no Maven, no pasting.** One file, one run, everything deployed.
 
 > **Docker networking note:** `host.docker.internal` does not resolve inside Exasol's UDF sandbox on Linux. Use the Docker bridge gateway IP instead. Find it with:
 >
