@@ -307,4 +307,4 @@ See [docs/lua-port/limitations.md](docs/lua-port/limitations.md) for full detail
 
 ## License
 
-Apache 2.0
+This project is licensed under the [MIT License](LICENSE).
