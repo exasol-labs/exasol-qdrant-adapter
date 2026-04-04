@@ -50,7 +50,7 @@ function QueryRewriter:_extract_collection(request)
 end
 
 function QueryRewriter:_extract_query_text(request)
-    local push = request.pushDownRequest or {}
+    local push = request.pushdownRequest or {}
     if not push.filter then return "" end
     return self:_walk_filter(push.filter) or ""
 end
@@ -76,7 +76,7 @@ function QueryRewriter:_walk_filter(node)
 end
 
 function QueryRewriter:_extract_limit(request)
-    local push = request.pushDownRequest or {}
+    local push = request.pushdownRequest or {}
     if push.limit and push.limit.numElements then
         return tonumber(push.limit.numElements) or DEFAULT_LIMIT
     end
@@ -94,24 +94,31 @@ function QueryRewriter:_embed(query_text)
         prompt = query_text,
     })
     local embedding = response.embedding
-    if not embedding or type(embedding) ~= "table" then
-        error("Ollama response missing 'embedding' array for model '" .. self._model .. "'")
+    if not embedding or type(embedding) ~= "table" or #embedding == 0 then
+        error("Ollama returned no embedding for model '" .. self._model .. "'")
     end
     return embedding
 end
 
 --- Serialises a float array from a cjson-decoded table into a JSON array string.
--- cjson.encode on a sub-table decoded from another cjson.decode call can
--- produce {} instead of [...].  Building the string manually is reliable.
 local function embedding_to_json(embedding)
-    local keys = {}
-    for k, _ in pairs(embedding) do
-        if type(k) == "number" then keys[#keys + 1] = k end
+    local n = #embedding
+    if n == 0 then
+        -- Diagnostic: check actual table contents
+        local info = "len=" .. tostring(n) .. " type=" .. type(embedding)
+        local cnt = 0
+        for k, _ in pairs(embedding) do cnt = cnt + 1 end
+        info = info .. " pairs_count=" .. cnt
+        if cnt > 0 then
+            for k, v in pairs(embedding) do
+                info = info .. " sample_k=" .. tostring(k) .. "(" .. type(k) .. ")"
+                break
+            end
+        end
+        error("embedding array is empty: " .. info)
     end
-    table.sort(keys)
     local parts = {}
-    for _, k in ipairs(keys) do parts[#parts + 1] = tostring(embedding[k]) end
-    if #parts == 0 then error("embedding array is empty after serialisation") end
+    for i = 1, n do parts[i] = tostring(embedding[i]) end
     return "[" .. table.concat(parts, ",") .. "]"
 end
 

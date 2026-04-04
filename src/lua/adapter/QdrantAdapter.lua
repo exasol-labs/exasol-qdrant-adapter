@@ -7,7 +7,7 @@ local AbstractVSAdapter = require("exasol.vscl.AbstractVirtualSchemaAdapter")
 local AdapterProperties = require("adapter.AdapterProperties")
 local MetadataReader    = require("adapter.MetadataReader")
 local QueryRewriter     = require("adapter.QueryRewriter")
-local capabilities_mod  = require("adapter.capabilities")
+local CAPABILITIES      = require("adapter.capabilities")
 
 local QdrantAdapter = {}
 QdrantAdapter.__index = QdrantAdapter
@@ -18,18 +18,27 @@ setmetatable(QdrantAdapter, {__index = AbstractVSAdapter})
 
 --- Creates a new QdrantAdapter instance.
 function QdrantAdapter:new()
-    local instance = AbstractVSAdapter.new(self)
-    return setmetatable(instance, self)
+    local instance = setmetatable({}, self)
+    instance:_init()
+    return instance
+end
+
+-- ─────────────────────────────────────────────
+-- Adapter identity (required by RequestDispatcher for logging)
+
+function QdrantAdapter:get_name()
+    return "Exasol Qdrant Virtual Schema"
+end
+
+function QdrantAdapter:get_version()
+    return "1.0.0"
 end
 
 -- ─────────────────────────────────────────────
 -- Capability declaration
 
 function QdrantAdapter:_define_capabilities()
-    -- EXCLUDED_CAPABILITIES is handled inside capabilities_mod.create().
-    -- Properties are not yet available at capability-declaration time,
-    -- so we always return the full set here; exclusions are handled per-request.
-    return capabilities_mod.create(nil)
+    return CAPABILITIES
 end
 
 -- ─────────────────────────────────────────────
@@ -40,7 +49,7 @@ function QdrantAdapter:create_virtual_schema(request)
     local props = self:_load_properties(request)
     props:validate()
     local tables = self:_read_metadata(props)
-    return {schemaMetadata = {tables = tables}}
+    return {type = "createVirtualSchema", schemaMetadata = {tables = tables}}
 end
 
 --- Handles refresh: re-read Qdrant collections and return updated schema metadata.
@@ -48,7 +57,7 @@ function QdrantAdapter:refresh(request)
     local props = self:_load_properties(request)
     props:validate()
     local tables = self:_read_metadata(props)
-    return {schemaMetadata = {tables = tables}}
+    return {type = "refresh", schemaMetadata = {tables = tables}}
 end
 
 --- Handles setProperties: merge old+new props, validate, re-read metadata.
@@ -59,7 +68,7 @@ function QdrantAdapter:set_properties(request)
     local merged    = old_props:merge(new_raw)
     merged:validate()
     local tables = self:_read_metadata(merged)
-    return {schemaMetadata = {tables = tables}}
+    return {type = "setProperties", schemaMetadata = {tables = tables}}
 end
 
 --- Handles pushDown: embed the query via Ollama, search Qdrant, return VALUES SQL.
@@ -73,12 +82,12 @@ function QdrantAdapter:push_down(request)
 
     local rewriter = QueryRewriter:new(qdrant_url, ollama_url, model, api_key)
     local sql = rewriter:rewrite(request)
-    return {sql = sql}
+    return {type = "pushdown", sql = sql}
 end
 
 --- Handles dropVirtualSchema: no-op, nothing to clean up.
 function QdrantAdapter:drop_virtual_schema(_request)
-    return {}
+    return {type = "dropVirtualSchema"}
 end
 
 -- ─────────────────────────────────────────────

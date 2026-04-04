@@ -8,7 +8,6 @@ local RequestDispatcher = require("exasol.vscl.RequestDispatcher")
 
 function adapter_call(request_json)
     local adapter    = QdrantAdapter:new()
-    local properties = AdapterProperties:new()
-    local dispatcher = RequestDispatcher:new(adapter, properties)
+    local dispatcher = RequestDispatcher:new(adapter, AdapterProperties)
     return dispatcher:adapter_call(request_json)
 end
