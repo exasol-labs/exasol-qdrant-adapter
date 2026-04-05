@@ -110,8 +110,8 @@ The UDF takes two columns from your table:
 Both must be `VARCHAR` — cast numeric or date columns with `CAST(... AS VARCHAR(...))`.
 
 ```sql
--- 1. Run scripts/create_udfs_ollama.sql in your SQL client to create the UDFs
---    (only needed once)
+-- 1. If you ran scripts/install_all.sql, the UDFs are already deployed — skip to step 2.
+--    Otherwise, run scripts/create_udfs_ollama.sql in your SQL client (only needed once).
 
 -- 2. Create the Qdrant collection (nomic-embed-text = 768 dimensions)
 SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
@@ -265,10 +265,15 @@ src/lua/
 └── util/
     └── http.lua                 # LuaSocket JSON GET/POST wrapper
 dist/
-└── adapter.lua                  # Single-file bundle (output of lua-amalg — deploy this)
+└── adapter.lua                  # Single-file bundle (output of lua-amalg)
 build/
 └── amalg.lua                    # Build script: lua build/amalg.lua → regenerates dist/
-exasol_udfs/                     # Python UDFs (EMBED_AND_PUSH, CREATE_QDRANT_COLLECTION)
+scripts/
+├── install_all.sql              # One-file installer (deploy entire stack)
+├── install_adapter.sql          # Standalone Lua adapter script only
+├── create_udfs_ollama.sql       # Python UDFs only
+└── test_connectivity.sql        # Pre-flight connectivity checks
+exasol_udfs/                     # Python UDF source (EMBED_AND_PUSH, CREATE_QDRANT_COLLECTION)
 docs/
 ├── lua-port/
 │   └── limitations.md           # Known Lua adapter limitations (TLS caveat etc.)

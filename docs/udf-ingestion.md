@@ -63,7 +63,9 @@ Use `172.17.0.1` as the Qdrant host (traffic is forwarded via the gateway to the
 
 ## Step 1 — Deploy the UDF Scripts
 
-Run `scripts/create_udfs_ollama.sql` directly in your SQL client (DBeaver, DbVisualizer, etc.). No SLC build or BucketFS upload is needed.
+If you used `scripts/install_all.sql` (the one-file installer), the UDFs are already deployed — skip to Step 2.
+
+Otherwise, run `scripts/create_udfs_ollama.sql` directly in your SQL client (DBeaver, DbVisualizer, etc.). No SLC build or BucketFS upload is needed.
 
 ```sql
 -- Prerequisites

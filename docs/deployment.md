@@ -5,109 +5,114 @@
 - Exasol 7.x or later (Docker or on-premise)
 - Qdrant 1.9+ running and reachable from Exasol
 - Ollama running with `nomic-embed-text` pulled
-- Maven 3.8+ and Java 21 for building
+
+No Maven, no Java, no BucketFS required.
 
 ---
 
-## Step 1 — Build the fat JAR
+## Option A — One-File Installer (Recommended)
 
-```bash
-mvn clean package -DskipTests
-# Output: target/qdrant-virtual-schema-0.1.0-all.jar  (~5.6 MB)
+The simplest way to deploy the entire stack. A single SQL file creates the schema, connection, Lua adapter, Python UDFs, and virtual schema.
+
+### 1. Open `scripts/install_all.sql` in your SQL client
+
+Use DBeaver, DbVisualizer, or any Exasol-compatible tool.
+
+### 2. Update the configuration values
+
+Find-and-replace these defaults throughout the file:
+
+| Default            | What it is                     | How to find yours                            |
+| ------------------ | ------------------------------ | -------------------------------------------- |
+| `172.17.0.1`       | Docker bridge gateway IP       | `docker exec exasoldb ip route show default` |
+| `6333`             | Qdrant port                    | Default unless you changed it                |
+| `11434`            | Ollama port                    | Default unless you changed it                |
+| `nomic-embed-text` | Ollama embedding model         | Must be pulled: `ollama pull nomic-embed-text` |
+| `ADAPTER`          | Schema name for scripts/UDFs   | Change if you prefer a different schema      |
+
+### 3. Run the entire file
+
+Execute the file as a script (not statement-by-statement). It deploys:
+
+- `ADAPTER` schema
+- `qdrant_conn` connection to Qdrant
+- `ADAPTER.VECTOR_SCHEMA_ADAPTER` — Lua adapter script
+- `ADAPTER.CREATE_QDRANT_COLLECTION` — Python UDF for collection creation
+- `ADAPTER.EMBED_AND_PUSH` — Python UDF for data ingestion
+- `vector_schema` virtual schema (auto-refreshed)
+
+### 4. Verify
+
+```sql
+-- List tables (one per Qdrant collection)
+SELECT * FROM EXA_ALL_TABLES WHERE TABLE_SCHEMA = 'VECTOR_SCHEMA';
 ```
+
+> **No BucketFS, no JAR, no Maven, no pasting.** One file, one run, everything deployed.
 
 ---
 
-## Step 2 — Deploy JAR to BucketFS
+## Option B — Deploy Components Individually
 
-### Option A: Exasol in Docker (copy directly)
+If you prefer to deploy the adapter and UDFs separately (e.g., you only need the adapter, or you want to customize the setup):
 
-```bash
-docker exec exasoldb mkdir -p /exa/data/bucketfs/bfsdefault/.dest/default/adapter
+### Adapter only
 
-docker cp target/qdrant-virtual-schema-0.1.0-all.jar \
-  exasoldb:/exa/data/bucketfs/bfsdefault/.dest/default/adapter/qdrant-virtual-schema-0.1.0-all.jar
+Run `scripts/install_adapter.sql` in your SQL client. This deploys only the Lua adapter script — no UDFs, no virtual schema.
+
+You will need to create the connection and virtual schema manually:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS ADAPTER;
+
+CREATE OR REPLACE CONNECTION qdrant_conn
+  TO 'http://172.17.0.1:6333'
+  USER ''
+  IDENTIFIED BY '';
+
+-- Run scripts/install_adapter.sql here
+
+CREATE VIRTUAL SCHEMA vector_schema
+  USING ADAPTER.VECTOR_SCHEMA_ADAPTER
+  WITH CONNECTION_NAME = 'qdrant_conn'
+       QDRANT_MODEL    = 'nomic-embed-text'
+       OLLAMA_URL      = 'http://172.17.0.1:11434';
 ```
 
-### Option B: BucketFS HTTPS upload (port 2581 must be exposed)
+### UDFs only
 
-```bash
-curl -k -X PUT -T target/qdrant-virtual-schema-0.1.0-all.jar \
-  "https://w:<write-password>@<exasol-host>:2581/default/adapter/qdrant-virtual-schema-0.1.0-all.jar"
-```
+Run `scripts/create_udfs_ollama.sql` to deploy just the Python UDFs (`CREATE_QDRANT_COLLECTION` and `EMBED_AND_PUSH`).
 
 ---
 
-## Step 3 — Find the Docker host IP (Docker deployments only)
+## Docker Networking
 
-The UDF sandbox inside Exasol cannot resolve `host.docker.internal`. Use the bridge gateway IP instead:
+Inside Exasol's container, `localhost` refers to the container itself and `host.docker.internal` does not resolve in the UDF sandbox on Linux. Use the Docker bridge gateway IP instead:
 
 ```bash
 docker exec exasoldb ip route show default
 # → default via 172.17.0.1 dev eth0
 ```
 
-Use `172.17.0.1` (or whatever is shown) in the connection and virtual schema properties below.
+Use `172.17.0.1` (or whatever is shown) for the Qdrant and Ollama URLs in the connection and virtual schema properties.
 
 ---
 
-## Step 4 — Create SQL objects in Exasol
+## Updating the Adapter
 
-Run in order in your SQL client:
+After modifying `src/lua/` source files:
 
-```sql
--- 1. Schema for the adapter script
-CREATE SCHEMA IF NOT EXISTS ADAPTER;
-
--- 2. Connection to Qdrant
-CREATE OR REPLACE CONNECTION qdrant_conn
-  TO 'http://172.17.0.1:6333'   -- replace with your Qdrant host IP
-  USER ''
-  IDENTIFIED BY '';              -- Qdrant API key if auth is enabled
-
--- 3. Adapter script
-CREATE OR REPLACE JAVA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
-  %scriptclass com.exasol.adapter.RequestDispatcher;
-  %jar /buckets/bfsdefault/default/adapter/qdrant-virtual-schema-0.1.0-all.jar;
-/
-
--- 4. Virtual schema
-CREATE VIRTUAL SCHEMA vector_schema
-  USING ADAPTER.VECTOR_SCHEMA_ADAPTER
-  WITH CONNECTION_NAME = 'qdrant_conn'
-       QDRANT_MODEL    = 'nomic-embed-text'
-       OLLAMA_URL      = 'http://172.17.0.1:11434';  -- replace with your Ollama host IP
+```bash
+# Rebuild the single-file bundle
+lua build/amalg.lua
 ```
 
-> **Important:** Step 3 must be executed as a single block using "Execute as Script" in your SQL client (not statement-by-statement), because the script body contains semicolons.
+Then re-run `scripts/install_all.sql` (or just the adapter portion). The `CREATE OR REPLACE` statements overwrite the previous version.
 
----
-
-## Step 5 — Verify
+No need to drop the virtual schema — just refresh it:
 
 ```sql
--- Should return the count of Qdrant collections (0 if none exist yet)
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
-
--- List tables (one per Qdrant collection)
-SELECT * FROM EXA_ALL_TABLES WHERE TABLE_SCHEMA = 'VECTOR_SCHEMA';
-```
-
----
-
-## Updating the JAR
-
-After rebuilding, redeploy the JAR (Step 2) and then force Exasol to reload it:
-
-```sql
-DROP VIRTUAL SCHEMA IF EXISTS vector_schema CASCADE;
-
--- Recreate (same as Step 4 above)
-CREATE VIRTUAL SCHEMA vector_schema
-  USING ADAPTER.VECTOR_SCHEMA_ADAPTER
-  WITH CONNECTION_NAME = 'qdrant_conn'
-       QDRANT_MODEL    = 'nomic-embed-text'
-       OLLAMA_URL      = 'http://172.17.0.1:11434';
 ```
 
 ---

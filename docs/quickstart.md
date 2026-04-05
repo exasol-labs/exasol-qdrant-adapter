@@ -46,8 +46,9 @@ docker run -d --name exasoldb \
   exasol/docker-db:latest
 ```
 
-> Exasol can take 1–2 minutes to fully start up. You can check it is ready by running:
-> `docker logs exasoldb 2>&1 | grep "ready to accept connections"`
+> Exasol can take 1–2 minutes to fully start up. You can check it is ready by trying to connect:
+> `docker exec exasoldb /bin/bash -c 'exaplus -c localhost:8563 -u sys -p exasol -sql "SELECT 1;"' 2>&1 | tail -5`
+> If this returns `1`, Exasol is ready. If it fails, wait another minute and retry.
 
 ---
 
@@ -77,7 +78,7 @@ Write this down too — you'll use it in Step 5.
 
 ---
 
-## Step 3 — Install the Adapter in Exasol
+## Step 3 — Install Everything in Exasol
 
 Open your SQL client (DBeaver, DbVisualizer, or any Exasol-compatible tool) and connect to:
 
@@ -86,68 +87,26 @@ Open your SQL client (DBeaver, DbVisualizer, or any Exasol-compatible tool) and 
 - **User:** `sys`
 - **Password:** `exasol`
 
-Then run the following SQL statements **one block at a time**.
+Open the file [`scripts/install_all.sql`](../scripts/install_all.sql) from this project. Replace `172.17.0.1` with the Docker bridge IP you found in Step 2 (if different), then run the entire file as a script.
 
-### 3a. Create the adapter schema
+This single file deploys everything:
 
-```sql
-CREATE SCHEMA IF NOT EXISTS ADAPTER;
-```
+- Schema and connection to Qdrant
+- Lua adapter script (the virtual schema engine)
+- Python UDFs for data ingestion (`CREATE_QDRANT_COLLECTION` and `EMBED_AND_PUSH`)
+- Virtual schema ready for queries
 
-### 3b. Create a connection to Qdrant
+> **No pasting, no manual steps.** One file, one run, everything deployed.
 
-Replace `<DOCKER_BRIDGE_IP>` with the IP you found in Step 2.
-
-```sql
-CREATE OR REPLACE CONNECTION qdrant_conn
-  TO 'http://<DOCKER_BRIDGE_IP>:6333'
-  USER ''
-  IDENTIFIED BY '';
-```
-
-### 3c. Install the adapter script
-
-Open the file `dist/adapter.lua` from this project in a text editor. Copy **all** of its contents.
-
-Then run the statement below, replacing `-- PASTE HERE` with the contents you just copied:
-
-```sql
-CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
-  -- PASTE HERE
-/
-```
-
-> **Tip:** In DBeaver, use "Execute as Script" (not "Execute Statement") for this block, because the script body contains semicolons.
-
-### 3d. Create the virtual schema
-
-Replace `<DOCKER_BRIDGE_IP>` with the same IP as in step 3b.
-
-```sql
-CREATE VIRTUAL SCHEMA vector_schema
-  USING ADAPTER.VECTOR_SCHEMA_ADAPTER
-  WITH CONNECTION_NAME = 'qdrant_conn'
-       QDRANT_MODEL    = 'nomic-embed-text'
-       OLLAMA_URL      = 'http://<DOCKER_BRIDGE_IP>:11434';
-```
+> **Tip:** In DBeaver, use "Execute as Script" (not "Execute Statement") to run the whole file at once.
 
 ---
 
-## Step 4 — Set Up the Ingestion UDFs
-
-The virtual schema is read-only — to load data into Qdrant, you use a small helper UDF.
-
-In your SQL client, open the file `scripts/create_udfs_ollama.sql` from this project and execute it. This creates two helper functions (`CREATE_QDRANT_COLLECTION` and `EMBED_AND_PUSH`) in the `ADAPTER` schema.
-
-You only need to do this once.
-
----
-
-## Step 5 — Create a Collection and Load the Support Knowledge Base
+## Step 4 — Create a Collection and Load the Support Knowledge Base
 
 Replace `<DOCKER_BRIDGE_IP>` and `<OLLAMA_IP>` with the IPs you found in Step 2.
 
-### 5a. Create a Qdrant collection
+### 4a. Create a Qdrant collection
 
 ```sql
 SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
@@ -155,7 +114,7 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 );
 ```
 
-### 5b. Load the sample knowledge base
+### 4b. Load the sample knowledge base
 
 This embeds 12 realistic support articles across 4 topic clusters and stores them in Qdrant. Copy and run the entire block as-is:
 
@@ -190,7 +149,7 @@ FROM (
 GROUP BY IPROC();
 ```
 
-### 5c. Refresh the virtual schema
+### 4c. Refresh the virtual schema
 
 This makes the `support_kb` collection visible as a table:
 
@@ -200,9 +159,11 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 
 ---
 
-## Step 6 — Run Semantic Searches
+## Step 5 — Run Semantic Searches
 
 Now run some searches and see how semantic understanding works in practice.
+
+> **Note on scores:** Your exact similarity scores will differ from the examples below — they vary by Ollama version, model version, and system architecture. What matters is the **ranking order** and that the correct **topic cluster** appears at the top.
 
 ### Query 1 — Direct match
 
@@ -215,11 +176,11 @@ WHERE "QUERY" = 'how do I reset my password'
 LIMIT 3;
 ```
 
-| ID       | TEXT (truncated)                                              | SCORE  |
-|----------|---------------------------------------------------------------|--------|
-| auth-001 | How to reset your password: Navigate to the login page...    | 0.9531 |
-| auth-002 | Setting up two-factor authentication: Two-factor auth adds...| 0.7812 |
-| auth-003 | Account locked after failed login attempts: Your account...  | 0.7654 |
+| ID       | TEXT (truncated)                                              | SCORE   |
+|----------|---------------------------------------------------------------|---------|
+| auth-001 | How to reset your password: Navigate to the login page...    | ~0.75+  |
+| auth-002 | Setting up two-factor authentication: Two-factor auth adds...| ~0.60+  |
+| auth-003 | Account locked after failed login attempts: Your account...  | ~0.60+  |
 
 > `auth-001` scores highest because the article is about exactly this — password reset. The other two are also about account security, so they score in the same neighbourhood.
 
@@ -236,11 +197,11 @@ WHERE "QUERY" = 'I keep getting locked out and cannot get in'
 LIMIT 3;
 ```
 
-| ID       | TEXT (truncated)                                              | SCORE  |
-|----------|---------------------------------------------------------------|--------|
-| auth-003 | Account locked after failed login attempts: Your account...  | 0.8904 |
-| auth-001 | How to reset your password: Navigate to the login page...    | 0.7821 |
-| auth-002 | Setting up two-factor authentication: Two-factor auth adds...| 0.7239 |
+| ID       | TEXT (truncated)                                              | SCORE   |
+|----------|---------------------------------------------------------------|---------|
+| auth-003 | Account locked after failed login attempts: Your account...  | ~0.70+  |
+| auth-001 | How to reset your password: Navigate to the login page...    | ~0.60+  |
+| auth-002 | Setting up two-factor authentication: Two-factor auth adds...| ~0.55+  |
 
 > Even though "locked out" and "cannot get in" don't appear in `auth-003`, the semantic meaning is the same as "account locked after failed login attempts." A keyword search would have returned nothing useful here.
 
@@ -257,11 +218,11 @@ WHERE "QUERY" = 'something is wrong with my billing'
 LIMIT 3;
 ```
 
-| ID       | TEXT (truncated)                                              | SCORE  |
-|----------|---------------------------------------------------------------|--------|
-| bill-003 | Cancelling your subscription: To cancel your subscription... | 0.8102 |
-| bill-002 | Updating your payment method: To change your credit card...  | 0.7893 |
-| bill-001 | Downloading your invoice: Invoices are available in the...   | 0.7711 |
+| ID       | TEXT (truncated)                                              | SCORE   |
+|----------|---------------------------------------------------------------|---------|
+| bill-003 | Cancelling your subscription: To cancel your subscription... | ~0.65+  |
+| bill-002 | Updating your payment method: To change your credit card...  | ~0.60+  |
+| bill-001 | Downloading your invoice: Invoices are available in the...   | ~0.55+  |
 
 > A vague query still surfaces the right cluster — all three billing articles. The scores are lower than the direct-match query, which reflects appropriate uncertainty. The user has enough to start exploring.
 

@@ -107,12 +107,22 @@ def run(ctx):
     base_url = f"http://{qdrant_host}:{qdrant_port}"
 
     # Collect all rows for this partition
-    all_ids, all_texts = [], []
+    all_ids, all_texts, skipped_nulls = [], [], 0
     while True:
-        all_ids.append(ctx.id)
-        all_texts.append(ctx.text_col)
+        row_id = ctx.id
+        row_text = ctx.text_col or ""
+        if row_id is None or row_id == "":
+            skipped_nulls += 1
+        else:
+            all_ids.append(row_id)
+            all_texts.append(row_text)
         if not ctx.next():
             break
+    if skipped_nulls > 0 and len(all_ids) == 0:
+        raise ValueError(
+            f"All {skipped_nulls} rows have NULL or empty IDs. "
+            "Provide a non-empty ID column."
+        )
 
     total_upserted = 0
     for i in range(0, len(all_ids), BATCH_SIZE):

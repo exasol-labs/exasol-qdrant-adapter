@@ -80,6 +80,9 @@ local function rewrite(req, props)
             qtext = l.value
         end
     end
+    if qtext == "" then
+        return "SELECT * FROM VALUES (CAST('NO_QUERY' AS VARCHAR(2000000) UTF8), CAST('Semantic search requires: WHERE \"QUERY\" = ''your search text''. Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema." .. col .. " WHERE \"QUERY\" = ''your search'' LIMIT 10' AS VARCHAR(2000000) UTF8), CAST(0 AS DOUBLE), CAST('' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"
+    end
     local limit = (pdr.limit and pdr.limit.numElements) and tonumber(pdr.limit.numElements) or 10
     local emb = http_post_json(ollama .. "/api/embeddings", {model=props.QDRANT_MODEL, prompt=qtext})
     assert(emb.embedding, "Ollama returned no embedding array")
@@ -103,7 +106,7 @@ local function rewrite(req, props)
     )
     local res = (sr.result or {}).points or {}
     if #res == 0 then
-        return "SELECT CAST('' AS VARCHAR(36) UTF8) AS ID, CAST('' AS VARCHAR(2000000) UTF8) AS TEXT, CAST(0 AS DOUBLE) AS SCORE, CAST('' AS VARCHAR(2000000) UTF8) AS QUERY FROM DUAL WHERE FALSE"
+        return "SELECT CAST('' AS VARCHAR(2000000) UTF8) AS ID, CAST('' AS VARCHAR(2000000) UTF8) AS TEXT, CAST(0 AS DOUBLE) AS SCORE, CAST('' AS VARCHAR(2000000) UTF8) AS QUERY FROM DUAL WHERE FALSE"
     end
     local rows, q = {}, esc(qtext)
     for _, pt in ipairs(res) do
@@ -152,7 +155,7 @@ function adapter_call(request_json)
         local ok2, result = pcall(rewrite, req, p)
         if not ok2 then
             local msg = esc(tostring(result))
-            return cjson.encode({type="pushdown", sql="SELECT '" .. msg .. "' AS ADAPTER_ERROR FROM DUAL"})
+            return cjson.encode({type="pushdown", sql="SELECT * FROM VALUES (CAST('ERROR' AS VARCHAR(2000000) UTF8), CAST('" .. msg .. "' AS VARCHAR(2000000) UTF8), CAST(0 AS DOUBLE), CAST('' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"})
         end
         return cjson.encode({type="pushdown", sql=result})
     else

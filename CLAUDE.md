@@ -10,7 +10,7 @@ Exasol Virtual Schema adapter for semantic similarity search using Qdrant (vecto
 
 ## Build
 
-The adapter deploys as a single file `dist/adapter.lua`, bundled by lua-amalg from `src/lua/`.
+The modular source lives in `src/lua/`. A bundled version (`dist/adapter.lua`) is built by lua-amalg, but deployment no longer requires pasting it — see Deployment below.
 
 ```bash
 # Install dev dependencies (once)
@@ -21,7 +21,7 @@ luarocks install virtual-schema-common-lua
 lua build/amalg.lua
 ```
 
-Output: `dist/adapter.lua` — paste into a `CREATE LUA ADAPTER SCRIPT` statement.
+Output: `dist/adapter.lua` (bundled single file). The standalone adapter in `scripts/install_adapter.sql` and `scripts/install_all.sql` is a self-contained flattened version that does not depend on this build step.
 
 ## Tests
 
@@ -67,7 +67,13 @@ Tests use `unittest.mock` (MagicMock, patch). No Lua tests exist currently — o
 
 ## Deployment
 
-No JAR, no BucketFS, no Maven. The adapter is a single Lua file pasted into SQL. Python UDFs are registered via `scripts/create_udfs_ollama.sql`.
+No JAR, no BucketFS, no Maven.
+
+**Primary method:** Run `scripts/install_all.sql` in any SQL client. This single file deploys the entire stack — schema, connection, Lua adapter, Python UDFs (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH`), and virtual schema. Users update 5 config values (host IP, ports, model, schema name) and execute.
+
+**Individual components:**
+- `scripts/install_adapter.sql` — Lua adapter script only
+- `scripts/create_udfs_ollama.sql` — Python UDFs only
 
 ## Infrastructure
 

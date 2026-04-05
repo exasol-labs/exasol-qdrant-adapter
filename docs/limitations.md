@@ -1,11 +1,11 @@
 # Limitations and Known Constraints
 
-## Unsupported DDL operations (task 9.4)
+## Unsupported DDL operations
 
 | SQL statement | Status | Notes |
 |---|---|---|
-| `CREATE TABLE` | Via companion script only | Use `EXECUTE SCRIPT CREATE_COLLECTION(name)` |
-| `INSERT INTO` | Via companion script only | Use `EXECUTE SCRIPT INGEST_TEXT(...)` |
+| `CREATE TABLE` | Via Python UDF | Use `SELECT ADAPTER.CREATE_QDRANT_COLLECTION(...)` |
+| `INSERT INTO` | Via Python UDF | Use `SELECT ADAPTER.EMBED_AND_PUSH(...) FROM ... GROUP BY IPROC()` |
 | `DROP TABLE` | No-op | Dropping the virtual schema does NOT delete Qdrant collections |
 | `ALTER TABLE` | Not supported | Column schema is fixed: ID, TEXT, SCORE, QUERY |
 | `TRUNCATE` | Not supported | Delete points via the Qdrant API or dashboard directly |
@@ -72,5 +72,7 @@ Unsupported patterns (will not push down correctly):
 
 ## Distance metric
 
-Only **cosine similarity** is used. Dot product and Euclidean distance are not
-supported in v1.
+The `CREATE_QDRANT_COLLECTION` UDF supports four distance metrics: **Cosine**,
+**Dot**, **Euclid**, and **Manhattan**. The metric is set at collection creation
+time and cannot be changed afterward. The adapter's query-time search uses
+whichever metric the collection was created with.

@@ -44,6 +44,7 @@
 -- └───────────────────────────────────────────────────────────────────────────┘
 
 CREATE SCHEMA IF NOT EXISTS ADAPTER;
+OPEN SCHEMA ADAPTER;
 
 
 -- ┌───────────────────────────────────────────────────────────────────────────┐
@@ -151,6 +152,9 @@ local function rewrite(req, props)
             qtext = l.value
         end
     end
+    if qtext == "" then
+        return "SELECT * FROM VALUES (CAST('NO_QUERY' AS VARCHAR(2000000) UTF8), CAST('Semantic search requires: WHERE \"QUERY\" = ''your search text''. Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema." .. col .. " WHERE \"QUERY\" = ''your search'' LIMIT 10' AS VARCHAR(2000000) UTF8), CAST(0 AS DOUBLE), CAST('' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"
+    end
     local limit = (pdr.limit and pdr.limit.numElements) and tonumber(pdr.limit.numElements) or 10
     local emb = http_post_json(ollama .. "/api/embeddings", {model=props.QDRANT_MODEL, prompt=qtext})
     assert(emb.embedding, "Ollama returned no embedding array")
@@ -174,7 +178,7 @@ local function rewrite(req, props)
     )
     local res = (sr.result or {}).points or {}
     if #res == 0 then
-        return "SELECT CAST('' AS VARCHAR(36) UTF8) AS ID, CAST('' AS VARCHAR(2000000) UTF8) AS TEXT, CAST(0 AS DOUBLE) AS SCORE, CAST('' AS VARCHAR(2000000) UTF8) AS QUERY FROM DUAL WHERE FALSE"
+        return "SELECT CAST('' AS VARCHAR(2000000) UTF8) AS ID, CAST('' AS VARCHAR(2000000) UTF8) AS TEXT, CAST(0 AS DOUBLE) AS SCORE, CAST('' AS VARCHAR(2000000) UTF8) AS QUERY FROM DUAL WHERE FALSE"
     end
     local rows, q = {}, esc(qtext)
     for _, pt in ipairs(res) do
@@ -222,7 +226,7 @@ function adapter_call(request_json)
         local ok2, result = pcall(rewrite, req, p)
         if not ok2 then
             local msg = esc(tostring(result))
-            return cjson.encode({type="pushdown", sql="SELECT '" .. msg .. "' AS ADAPTER_ERROR FROM DUAL"})
+            return cjson.encode({type="pushdown", sql="SELECT * FROM VALUES (CAST('ERROR' AS VARCHAR(2000000) UTF8), CAST('" .. msg .. "' AS VARCHAR(2000000) UTF8), CAST(0 AS DOUBLE), CAST('' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"})
         end
         return cjson.encode({type="pushdown", sql=result})
     else
@@ -348,7 +352,7 @@ import socket
 
 BATCH_SIZE = 100
 MAX_RETRIES = 3
-MAX_CHARS = 6000  -- ~1500 tokens, safe for nomic-embed-text (2048 token limit)
+MAX_CHARS = 6000  # ~1500 tokens, safe for nomic-embed-text (2048 token limit)
 
 def _truncate(texts):
     return [t[:MAX_CHARS] if t and len(t) > MAX_CHARS else (t or "") for t in texts]
@@ -434,15 +438,20 @@ def run(ctx):
     if provider not in ("openai", "ollama"):
         raise ValueError("provider must be 'ollama' or 'openai', got: " + provider)
 
-    all_ids, all_texts = [], []
+    all_ids, all_texts, skipped_nulls = [], [], 0
     while True:
-        row_id   = ctx.id   or ""
+        row_id   = ctx.id
         row_text = ctx.text_col or ""
-        if row_id or row_text:
+        if row_id is None or row_id == "":
+            skipped_nulls += 1
+        else:
             all_ids.append(row_id)
             all_texts.append(row_text)
         if not ctx.next():
             break
+    if skipped_nulls > 0 and len(all_ids) == 0:
+        raise ValueError("All " + str(skipped_nulls) + " rows have NULL or empty IDs. Provide a non-empty ID column.")
+
 
     total = 0
     for i in range(0, len(all_ids), BATCH_SIZE):
@@ -469,7 +478,12 @@ def run(ctx):
 -- After creating, each collection appears as a table with columns:
 --   ID (VARCHAR), TEXT (VARCHAR), SCORE (DOUBLE), QUERY (VARCHAR)
 
-CREATE VIRTUAL SCHEMA IF NOT EXISTS vector_schema
+-- DROP + CREATE is used instead of IF NOT EXISTS because Exasol cannot
+-- update virtual schema properties in-place. This is safe — dropping a
+-- virtual schema does NOT delete Qdrant data (it is just a metadata mapping).
+DROP VIRTUAL SCHEMA IF EXISTS vector_schema CASCADE;
+
+CREATE VIRTUAL SCHEMA vector_schema
     USING ADAPTER.VECTOR_SCHEMA_ADAPTER
     WITH CONNECTION_NAME = 'qdrant_conn'
          QDRANT_MODEL    = 'nomic-embed-text'
@@ -507,13 +521,19 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 --
 -- ── Ingest Data from an Exasol Table ────────────────────────────────────────
 --
+--   NOTE: For the Ollama URL below, use the Ollama container IP if Ollama
+--   runs in Docker (find it with: docker inspect ollama --format '{{range
+--   .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'). The Docker bridge
+--   gateway IP (172.17.0.1) works for Qdrant (port-mapped) but may not
+--   resolve correctly for Ollama depending on your Docker setup.
+--
 --   SELECT ADAPTER.EMBED_AND_PUSH(
 --       CAST(row_number AS VARCHAR(36)), -- unique ID column
 --       "name" || ' in ' || "city",      -- text to embed (concatenate columns)
 --       '172.17.0.1', 6333, '',          -- Qdrant host, port, API key
 --       'my_collection',                  -- target collection
 --       'ollama',                         -- provider ('ollama' or 'openai')
---       'http://172.17.0.1:11434',        -- Ollama URL (or OpenAI API key)
+--       'http://<OLLAMA_IP>:11434',       -- Ollama URL (see NOTE above)
 --       'nomic-embed-text'                -- embedding model
 --   )
 --   FROM my_schema.my_table

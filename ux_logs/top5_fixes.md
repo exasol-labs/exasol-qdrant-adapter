@@ -4,16 +4,13 @@ Identified from a 10-iteration UX study (2026-04-03) where the full Exasol Qdran
 
 ---
 
-## 1. One-Command Installer / Deployment Script
+## 1. One-Command Installer / Deployment Script -- IMPLEMENTED
 
-**Current state**: The Lua adapter is a 3,527-line / 134KB single file (`dist/adapter.lua`) that must be manually pasted into a `CREATE LUA ADAPTER SCRIPT` statement. Single-quote escaping, SQL client buffer limits, and `SYS.EXA_ALL_SCRIPTS.SCRIPT_TEXT` including the CREATE header cause double-header syntax errors when copying between schemas.
+**Status**: Implemented in commit `75dd951` (2026-04-04). See `scripts/install_all.sql`.
 
-**Impact**: This is the single biggest barrier to adoption. Every competitor (pgvector, Databricks, Snowflake Cortex) ships as a single installable package or 1-line DDL. Reported in iterations 3, 6, 7, 10.
+**What was done**: Created `scripts/install_all.sql` — a single SQL file that deploys the entire stack (schema, connection, Lua adapter, Python UDFs, virtual schema) with no pasting required. Users update 5 config values and run one file.
 
-**Proposed fix**:
-- Create a `scripts/install.sql` that wraps the full adapter with proper escaping
-- Or build an installer UDF that reads the adapter from a URL/connection and deploys it
-- Long-term: `INSTALL EXTENSION 'qdrant-vector-search'` syntax
+**Previous state**: The Lua adapter was a 3,527-line / 134KB single file (`dist/adapter.lua`) that had to be manually pasted into a `CREATE LUA ADAPTER SCRIPT` statement. Single-quote escaping, SQL client buffer limits, and `SYS.EXA_ALL_SCRIPTS.SCRIPT_TEXT` including the CREATE header caused double-header syntax errors when copying between schemas.
 
 **Estimated UX lift**: 4.9 -> 6.5 (this fix alone addresses the #1 complaint across all iterations)
 
@@ -89,7 +86,7 @@ Identified from a 10-iteration UX study (2026-04-03) where the full Exasol Qdran
 
 | # | Fix | Effort | UX Lift |
 |---|-----|--------|---------|
-| 1 | One-command installer | Medium | +1.6 |
+| 1 | ~~One-command installer~~ | ~~Medium~~ | ~~+1.6~~ DONE |
 | 2 | Graceful empty-query | Low | +0.5 |
 | 3 | Collection scoping | Low-Medium | +0.3 |
 | 4 | CONNECTION-based UDF config | Medium | +0.4 |

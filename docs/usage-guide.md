@@ -2,78 +2,83 @@
 
 ## Overview
 
-This adapter provides pseudo-native vector search in Exasol by bridging SQL to
-Qdrant's inference API. Users work entirely in SQL:
+This adapter provides semantic vector search in Exasol by bridging SQL to
+Qdrant's vector search API. Users work entirely in SQL:
 
 | User story | SQL pattern |
 |---|---|
-| Create a vector table | `EXECUTE SCRIPT vector_schema.CREATE_COLLECTION('table_name')` |
-| Insert text data | `EXECUTE SCRIPT vector_schema.INGEST_TEXT('table_name', 'id', 'text')` |
-| Similarity search | `SELECT id, text, score FROM vector_schema.table_name WHERE query = '...' LIMIT k` |
+| Create a vector collection | `SELECT ADAPTER.CREATE_QDRANT_COLLECTION(...)` |
+| Ingest data from Exasol | `SELECT ADAPTER.EMBED_AND_PUSH(...) FROM my_table GROUP BY IPROC()` |
+| Similarity search | `SELECT "ID", "TEXT", "SCORE" FROM vector_schema.table WHERE "QUERY" = '...' LIMIT k` |
 
-> **Note on CREATE TABLE and INSERT:**
-> The Exasol Virtual Schema framework forwards only SELECT queries as push-downs.
-> For CREATE TABLE and INSERT, this adapter provides companion Lua scripts
-> (`CREATE_COLLECTION` and `INGEST_TEXT`) that maintain the same SQL-oriented
-> developer experience.
+> **Note:** The Exasol Virtual Schema framework forwards only SELECT queries as push-downs.
+> Data ingestion is handled by companion Python UDFs (`CREATE_QDRANT_COLLECTION`
+> and `EMBED_AND_PUSH`) that embed text via Ollama and upsert vectors into Qdrant.
 
 ---
 
-## Creating a vector table (US-01)
+## Creating a vector collection
 
 ```sql
--- Creates a Qdrant collection named "articles" using the schema-level model
-EXECUTE SCRIPT vector_schema.CREATE_COLLECTION('articles');
+-- Creates a Qdrant collection named "articles" (768 dims for nomic-embed-text)
+SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
+    '172.17.0.1', 6333, '', 'articles', 768, 'Cosine', ''
+);
 
 -- The collection appears as a table after refreshing the schema:
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 
 -- Verify:
-SELECT * FROM vector_schema.articles LIMIT 0;
--- Columns: ID VARCHAR(36), TEXT VARCHAR(2000000), SCORE DOUBLE, QUERY VARCHAR(2000000)
+SELECT * FROM EXA_ALL_TABLES WHERE TABLE_SCHEMA = 'VECTOR_SCHEMA';
+-- Columns per table: ID VARCHAR, TEXT VARCHAR, SCORE DOUBLE, QUERY VARCHAR
 ```
 
-If the collection already exists, `CREATE_COLLECTION` returns an error.
+If the collection already exists, `CREATE_QDRANT_COLLECTION` returns `'exists: articles'`.
 
 ---
 
-## Inserting text data (US-02)
+## Ingesting text data
 
 ```sql
--- Single row
-EXECUTE SCRIPT vector_schema.INGEST_TEXT('articles', 'doc-001',
-    'Exasol is a high-performance analytical database.');
-
--- Batch insert (recommended for large volumes)
-EXECUTE SCRIPT vector_schema.INGEST_BATCH('articles',
-    'doc-001', 'Exasol is a high-performance analytical database.',
-    'doc-002', 'Qdrant is a vector similarity search engine.',
-    'doc-003', 'Natural language processing enables semantic search.'
-);
+-- Embed and push rows from an Exasol table into Qdrant
+SELECT ADAPTER.EMBED_AND_PUSH(
+    CAST(doc_id AS VARCHAR(36)),    -- unique ID column
+    doc_text,                        -- text column to embed
+    '172.17.0.1', 6333, '',         -- Qdrant host, port, API key
+    'articles',                      -- collection name
+    'ollama',                        -- provider
+    'http://172.17.0.4:11434',       -- Ollama URL
+    'nomic-embed-text'               -- model
+)
+FROM MY_SCHEMA.DOCUMENTS
+GROUP BY IPROC();
 ```
 
-Qdrant computes the embeddings using the schema-configured model. The original
-text is stored as a payload field so it can be returned in search results.
+`GROUP BY IPROC()` is required for SET UDFs — it distributes work across Exasol cluster nodes. The UDF returns one summary row per node: `(partition_id, upserted_count)`.
 
 Duplicate IDs are handled as upserts (the existing point is overwritten).
 
+See [udf-ingestion.md](udf-ingestion.md) for the full parameter reference, OpenAI provider usage, and troubleshooting.
+
 ---
 
-## Similarity search (US-03)
+## Similarity search
 
 ```sql
 -- Find the 5 most semantically similar articles to a query
-SELECT id, text, score
+SELECT "ID", "TEXT", "SCORE"
 FROM vector_schema.articles
-WHERE query = 'fast analytical databases'
+WHERE "QUERY" = 'fast analytical databases'
 LIMIT 5;
 
 -- Results are ordered by score DESC (most similar first)
--- Columns: ID, TEXT, SCORE (cosine similarity, range 0–1)
+-- SCORE is cosine similarity, range 0-1
 ```
 
-The `query` column is a pseudo-column: filtering on it triggers a vector search.
-Do not include `QUERY` in the SELECT list unless you want the query string echoed back.
+The `"QUERY"` column is a pseudo-column: filtering on it triggers a vector search.
+Always quote column names with double quotes to avoid Exasol reserved word conflicts.
+
+> **Default limit:** When `LIMIT` is omitted, the adapter returns at most **10 results**.
 
 ---
 
@@ -81,15 +86,33 @@ Do not include `QUERY` in the SELECT list unless you want the query string echoe
 
 ```sql
 -- Join search results with a real Exasol table
-SELECT s.id, s.score, d.author, d.published_date
+SELECT s."ID", s."SCORE", d.author, d.published_date
 FROM (
-    SELECT id, score
+    SELECT "ID", "SCORE"
     FROM vector_schema.articles
-    WHERE query = 'machine learning'
+    WHERE "QUERY" = 'machine learning'
     LIMIT 10
 ) s
-JOIN real_schema.document_metadata d ON s.id = d.doc_id
-ORDER BY s.score DESC;
+JOIN real_schema.document_metadata d ON s."ID" = d.doc_id
+ORDER BY s."SCORE" DESC;
+```
+
+---
+
+## Virtual schema properties
+
+| Property          | Required | Default                  | Description                                      |
+| ----------------- | -------- | ------------------------ | ------------------------------------------------ |
+| `CONNECTION_NAME` | Yes      | --                       | Exasol CONNECTION object with Qdrant URL         |
+| `QDRANT_MODEL`    | Yes      | --                       | Ollama model name for embeddings                 |
+| `OLLAMA_URL`      | No       | `http://localhost:11434` | Ollama base URL reachable from Exasol            |
+| `QDRANT_URL`      | No       | --                       | Override Qdrant URL (ignores CONNECTION address)  |
+
+Change properties without dropping the schema:
+
+```sql
+ALTER VIRTUAL SCHEMA vector_schema SET OLLAMA_URL = 'http://172.17.0.4:11434';
+ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 ```
 
 ---

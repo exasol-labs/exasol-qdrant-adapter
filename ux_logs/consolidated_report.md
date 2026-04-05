@@ -35,11 +35,9 @@ Each iteration deployed the full semantic search stack from scratch using the `M
 - **Impact**: First thing any SQL user will try. Instant confusion.
 - **Fix**: Return an empty result set or a clear error: "Semantic search requires WHERE \"QUERY\" = 'your search text'"
 
-### 2. 3,500-Line Lua File Deployment is Impractical
+### ~~2. 3,500-Line Lua File Deployment is Impractical~~ — RESOLVED
 - **Source**: Iterations 3, 6, 7, 10
-- **Problem**: The adapter is a 134KB single file that must be pasted into a CREATE ADAPTER SCRIPT statement. Single-quote escaping, client buffer limits, and `SYS.EXA_ALL_SCRIPTS.SCRIPT_TEXT` including the CREATE header cause double-header syntax errors when copying between schemas.
-- **Impact**: Biggest barrier to adoption. Every competitor ships as an installable package.
-- **Fix**: Provide a deployment SQL script that wraps the adapter in proper escaping, or an installer UDF.
+- **Resolution**: Implemented `scripts/install_all.sql` (commit `75dd951`, 2026-04-04). A single SQL file deploys the entire stack — no pasting, no manual escaping. Users update 5 config values and run one file.
 
 ### 3. UDF Credentials Exposed in Audit Logs
 - **Source**: Iteration 8
@@ -174,7 +172,7 @@ REFRESH VECTOR SEARCH INDEX bank_search;
 
 ## Top 5 Most Impactful Improvements (Ranked)
 
-1. **One-command installer / deployment script** — Eliminates the #1 adoption barrier (pasting 3,500 lines of Lua)
+1. ~~**One-command installer / deployment script**~~ — DONE (`scripts/install_all.sql`)
 2. **Graceful empty-query handling** — Return empty results or clear error instead of crashing
 3. **Collection scoping on virtual schemas** — Enable multi-tenant and multi-project use
 4. **CONNECTION-based UDF config** — Reduce EMBED_AND_PUSH from 9 parameters to 2-3, hide credentials
@@ -188,4 +186,4 @@ The Exasol Qdrant adapter has a **strong architectural foundation** — Exasol's
 
 The gap is **developer experience**: deployment friction, error handling, documentation, and operational tooling. Addressing the top 5 improvements above would likely raise the UX score from **4.9/10 to 7-8/10** and make the adapter accessible to general data engineers rather than only deep Exasol experts.
 
-**Single biggest barrier to adoption**: Pasting a 3,500-line Lua file into a SQL statement with manual quote escaping.
+**Single biggest barrier to adoption**: ~~Pasting a 3,500-line Lua file into a SQL statement with manual quote escaping.~~ Resolved — `scripts/install_all.sql` eliminates manual pasting entirely.
