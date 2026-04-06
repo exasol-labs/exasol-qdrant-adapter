@@ -47,16 +47,18 @@ Tests use `unittest.mock` (MagicMock, patch). No Lua tests exist currently — o
 
 - `entry.lua` — Global `adapter_call()` entrypoint, delegates to RequestDispatcher
 - `adapter/QdrantAdapter.lua` — Adapter lifecycle: createVirtualSchema, refresh, setProperties, pushDown, dropVirtualSchema. Extends `AbstractVirtualSchemaAdapter` from `virtual-schema-common-lua`
-- `adapter/AdapterProperties.lua` — Property keys (CONNECTION_NAME, QDRANT_MODEL, OLLAMA_URL, QDRANT_URL), validation, defaults
-- `adapter/MetadataReader.lua` — Maps Qdrant collections to Exasol tables with fixed 4-column schema: ID (VARCHAR), TEXT (VARCHAR), SCORE (DOUBLE), QUERY (VARCHAR)
-- `adapter/QueryRewriter.lua` — Embeds query text via Ollama, searches Qdrant, builds VALUES SQL for pushDown response
+- `adapter/AdapterProperties.lua` — Property keys (CONNECTION_NAME, QDRANT_MODEL, OLLAMA_URL, QDRANT_URL, COLLECTION_FILTER), validation, defaults
+- `adapter/MetadataReader.lua` — Maps Qdrant collections to Exasol tables with fixed 4-column schema: ID (VARCHAR), TEXT (VARCHAR), SCORE (DOUBLE), QUERY (VARCHAR). Supports glob-based collection filtering via COLLECTION_FILTER property.
+- `adapter/QueryRewriter.lua` — Embeds query text via Ollama, searches Qdrant, builds VALUES SQL for pushDown response. Gracefully handles empty/missing query text (returns hint row instead of crashing).
 - `adapter/capabilities.lua` — Declares supported capabilities (SELECTLIST_EXPRESSIONS, FILTER_EXPRESSIONS, LIMIT, EQUAL predicate, STRING literal)
 - `util/http.lua` — LuaSocket + cjson HTTP wrapper (get_json, post_json, post_raw)
 
 ### Python UDFs (`exasol_udfs/`)
 
 - `embed_and_push.py` — SET UDF: batch embed text via Ollama/OpenAI -> upsert into Qdrant. Uses only Python stdlib (no pip packages)
+- `embed_and_push_v2` — (in `install_all.sql`) Simplified 4-parameter SET UDF that reads config from a CONNECTION object: `EMBED_AND_PUSH_V2(connection_name, collection, id, text)`. Credentials stay in the CONNECTION, not in SQL text.
 - `create_collection.py` — Scalar UDF: create a Qdrant collection with specified dimensions and distance metric
+- `preflight_check` — (in `install_all.sql`) Scalar UDF: `PREFLIGHT_CHECK(qdrant_url, ollama_url, model)` validates Qdrant connectivity, Ollama connectivity, model availability, and embedding round-trip. Returns structured pass/fail report.
 
 ### Key Patterns
 
@@ -69,7 +71,7 @@ Tests use `unittest.mock` (MagicMock, patch). No Lua tests exist currently — o
 
 No JAR, no BucketFS, no Maven.
 
-**Primary method:** Run `scripts/install_all.sql` in any SQL client. This single file deploys the entire stack — schema, connection, Lua adapter, Python UDFs (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH`), and virtual schema. Users update 5 config values (host IP, ports, model, schema name) and execute.
+**Primary method:** Run `scripts/install_all.sql` in any SQL client. This single file deploys the entire stack — schema, connection, Lua adapter, Python UDFs (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH`, `EMBED_AND_PUSH_V2`, `PREFLIGHT_CHECK`), and virtual schema. Users update 5 config values (host IP, ports, model, schema name) and execute.
 
 **Individual components:**
 - `scripts/install_adapter.sql` — Lua adapter script only
@@ -81,6 +83,49 @@ No JAR, no BucketFS, no Maven.
 - **Qdrant 1.9+** on port 6333
 - **Ollama** on port 11434 with `nomic-embed-text` model (768 dimensions)
 - Docker bridge gateway IP (usually `172.17.0.1`) used for container-to-container communication — `host.docker.internal` does not work in Exasol's UDF sandbox on Linux
+
+## Test Dataset
+
+**Always use `MUFA.SEMANTIC` as the test/demo dataset** when deploying, testing, or demonstrating the semantic search stack. Do not create ad-hoc sample data — use this table.
+
+- **Table:** `MUFA.SEMANTIC` (544 rows — US bank failures)
+- **Columns:** `"c1"` (ID, DECIMAL), `"Bank"`, `"City"`, `"State"`, `"Date"`, `"Acquired by"`, `"Assets ($mil.)"`
+- **Qdrant collection name:** `bank_failures`
+- **ID column:** `CAST(ROWNUM AS VARCHAR(36))` (note: `"c1"` is NOT unique — it repeats per year, only 157 distinct values across 544 rows)
+- **Text column:** Concatenate into a descriptive sentence for best embedding quality:
+  ```sql
+  "Bank" || ' in ' || "City" || ', ' || "State" || '. Failed on ' || CAST("Date" AS VARCHAR(10)) || '. Acquired by ' || "Acquired by" || '. Assets: $' || CAST("Assets ($mil.)" AS VARCHAR(20)) || ' million.'
+  ```
+
+**Ingestion command (after deploying via install_all.sql):**
+```sql
+SELECT ADAPTER.CREATE_QDRANT_COLLECTION('172.17.0.1', 6333, '', 'bank_failures', 768, 'Cosine', '');
+
+SELECT ADAPTER.EMBED_AND_PUSH(
+    CAST(ROWNUM AS VARCHAR(36)),
+    "Bank" || ' in ' || "City" || ', ' || "State" || '. Failed on ' || CAST("Date" AS VARCHAR(10)) || '. Acquired by ' || "Acquired by" || '. Assets: $' || CAST("Assets ($mil.)" AS VARCHAR(20)) || ' million.',
+    '172.17.0.1', 6333, '',
+    'bank_failures',
+    'ollama',
+    'http://172.17.0.1:11434',
+    'nomic-embed-text'
+)
+FROM MUFA.SEMANTIC
+GROUP BY IPROC();
+
+ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+```
+
+**Example queries:**
+```sql
+SELECT "ID", "TEXT", "SCORE" FROM vector_schema.bank_failures WHERE "QUERY" = 'banks acquired by JP Morgan' LIMIT 5;
+SELECT "ID", "TEXT", "SCORE" FROM vector_schema.bank_failures WHERE "QUERY" = 'large bank failures in New York' LIMIT 5;
+SELECT "ID", "TEXT", "SCORE" FROM vector_schema.bank_failures WHERE "QUERY" = 'small community banks in the midwest' LIMIT 5;
+```
+
+## UX Pipeline
+
+The `ux-pipeline/` folder contains an automated agent pipeline for implementing and testing UX fixes. Entry point: `.claude/agents/ux-pipeline.md`. See `ux-pipeline/README.md` for details. Test artifacts are committed in `ux-pipeline/tests/topic-N/`.
 
 ## OpenSpec
 

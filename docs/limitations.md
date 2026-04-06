@@ -76,3 +76,38 @@ The `CREATE_QDRANT_COLLECTION` UDF supports four distance metrics: **Cosine**,
 **Dot**, **Euclid**, and **Manhattan**. The metric is set at collection creation
 time and cannot be changed afterward. The adapter's query-time search uses
 whichever metric the collection was created with.
+
+---
+
+## Semantic search only — no BM25 / keyword search
+
+The adapter uses vector similarity exclusively. There is no BM25 or keyword
+search capability. For hybrid search (semantic + keyword), query Qdrant directly
+or use a separate full-text search solution alongside the virtual schema.
+
+---
+
+## Fixed 4-column schema
+
+Each virtual table exposes exactly four columns: `ID`, `TEXT`, `SCORE`, `QUERY`.
+Custom Qdrant payload fields are not directly accessible through the virtual
+schema. To access additional metadata, JOIN the search results with your original
+Exasol table using the ID column.
+
+---
+
+## Query latency
+
+Each query takes approximately **5–8 seconds**. This latency is dominated by
+Exasol's Lua sandbox initialization (~80% of total time), not by the embedding
+or vector search (~150ms combined). This is a known characteristic of Exasol's
+UDF sandbox architecture.
+
+For sub-second latency, query Ollama and Qdrant directly via their HTTP APIs.
+
+---
+
+## Single vector field
+
+The adapter searches the `text` vector field only. Multi-vector collections
+(collections with multiple named vector fields) are not supported.

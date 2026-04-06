@@ -56,7 +56,7 @@ docker run -d --name exasoldb \
 
 > **Why this matters:** When Exasol runs inside a Docker container, the word `localhost` refers to the container itself — not your computer. You need to use special IP addresses so the services can talk to each other.
 
-### Your Docker Bridge IP (used for Qdrant and the virtual schema)
+### Your Docker Bridge IP (used for ALL services)
 
 Run this command to find it:
 
@@ -65,16 +65,7 @@ docker exec exasoldb ip route show default
 # Example output: default via 172.17.0.1 dev eth0
 ```
 
-The IP after `via` (e.g., `172.17.0.1`) is your **Docker bridge IP**. Write it down — you'll use it in Steps 3 and 4.
-
-### Your Ollama Container IP (used for the ingestion UDFs)
-
-```bash
-docker inspect ollama --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
-# Example output: 172.17.0.4
-```
-
-Write this down too — you'll use it in Step 5.
+The IP after `via` (e.g., `172.17.0.1`) is your **Docker bridge IP**. Write it down — you'll use it for **everything**: Qdrant, Ollama, the virtual schema, and the ingestion UDFs. You do NOT need individual container IPs.
 
 ---
 
@@ -89,22 +80,29 @@ Open your SQL client (DBeaver, DbVisualizer, or any Exasol-compatible tool) and 
 
 Open the file [`scripts/install_all.sql`](../scripts/install_all.sql) from this project. Replace `172.17.0.1` with the Docker bridge IP you found in Step 2 (if different), then run the entire file as a script.
 
+> **SQL client setup:** This file uses `/` (forward slash on its own line) as the
+> statement separator — not `;`. Configure your SQL client accordingly:
+>
+> - **DBeaver:** Use *SQL Editor → Execute SQL Script* (Alt+X). If it fails,
+>   go to *Window → Preferences → SQL Editor* and set the "Script statement delimiter" to `/`.
+> - **DbVisualizer:** The `/` delimiter is supported by default when using "Execute as Script."
+> - **exaplus (CLI):** Run with `exaplus -f install_all.sql` — it handles `/` natively.
+
 This single file deploys everything:
 
 - Schema and connection to Qdrant
 - Lua adapter script (the virtual schema engine)
-- Python UDFs for data ingestion (`CREATE_QDRANT_COLLECTION` and `EMBED_AND_PUSH`)
+- Python UDFs for data ingestion (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH_V2`, `EMBED_AND_PUSH`)
+- Preflight health check UDF (`PREFLIGHT_CHECK`)
 - Virtual schema ready for queries
 
 > **No pasting, no manual steps.** One file, one run, everything deployed.
-
-> **Tip:** In DBeaver, use "Execute as Script" (not "Execute Statement") to run the whole file at once.
 
 ---
 
 ## Step 4 — Create a Collection and Load the Support Knowledge Base
 
-Replace `<DOCKER_BRIDGE_IP>` and `<OLLAMA_IP>` with the IPs you found in Step 2.
+Replace `<DOCKER_BRIDGE_IP>` with the IP you found in Step 2 (e.g., `172.17.0.1`). Use the same IP for everything.
 
 ### 4a. Create a Qdrant collection
 
@@ -116,16 +114,17 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 
 ### 4b. Load the sample knowledge base
 
-This embeds 12 realistic support articles across 4 topic clusters and stores them in Qdrant. Copy and run the entire block as-is:
+This embeds 12 realistic support articles across 4 topic clusters and stores them in Qdrant. The `embedding_conn` CONNECTION was already created by `install_all.sql` — it contains the Qdrant URL, Ollama URL, provider, and model config so you only need 4 parameters.
+
+> **Timing:** Embedding 12 documents takes about 10–15 seconds. The query will
+> appear to "hang" until all embeddings are computed and uploaded — this is normal.
 
 ```sql
-SELECT ADAPTER.EMBED_AND_PUSH(
-    id_col, text_col,
-    '<DOCKER_BRIDGE_IP>', 6333, '',
+SELECT ADAPTER.EMBED_AND_PUSH_V2(
+    'embedding_conn',
     'support_kb',
-    'ollama',
-    'http://<OLLAMA_IP>:11434',
-    'nomic-embed-text'
+    id_col,
+    text_col
 )
 FROM (
     VALUES

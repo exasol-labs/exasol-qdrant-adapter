@@ -32,13 +32,19 @@ Find-and-replace these defaults throughout the file:
 
 ### 3. Run the entire file
 
+> **SQL client setup:** This file uses `/` (forward slash on its own line) as the
+> statement separator — not `;`. In DBeaver, use *SQL Editor → Execute SQL Script* (Alt+X).
+> In DbVisualizer, use "Execute as Script." With exaplus CLI: `exaplus -f install_all.sql`.
+
 Execute the file as a script (not statement-by-statement). It deploys:
 
 - `ADAPTER` schema
-- `qdrant_conn` connection to Qdrant
+- `qdrant_conn` and `embedding_conn` connections
 - `ADAPTER.VECTOR_SCHEMA_ADAPTER` — Lua adapter script
 - `ADAPTER.CREATE_QDRANT_COLLECTION` — Python UDF for collection creation
-- `ADAPTER.EMBED_AND_PUSH` — Python UDF for data ingestion
+- `ADAPTER.EMBED_AND_PUSH_V2` — Python UDF for data ingestion (recommended, CONNECTION-based)
+- `ADAPTER.EMBED_AND_PUSH` — Python UDF for data ingestion (legacy, 9 parameters)
+- `ADAPTER.PREFLIGHT_CHECK` — Python UDF for connectivity validation
 - `vector_schema` virtual schema (auto-refreshed)
 
 ### 4. Verify
@@ -122,6 +128,8 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 Dropping the virtual schema does **not** delete Qdrant collections:
 
 ```sql
-DROP VIRTUAL SCHEMA vector_schema CASCADE;
+-- WARNING: Do NOT use CASCADE — it can destroy the ADAPTER schema
+-- (scripts, connections, everything). Use DROP FORCE instead.
+DROP FORCE VIRTUAL SCHEMA IF EXISTS vector_schema;
 -- Qdrant collections remain intact and can be reattached later
 ```

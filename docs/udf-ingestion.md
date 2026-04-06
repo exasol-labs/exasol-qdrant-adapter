@@ -2,10 +2,10 @@
 
 Because Exasol virtual schemas are read-only, data cannot flow from Exasol into
 Qdrant through the virtual schema adapter. This guide shows how to use the
-**`EMBED_AND_PUSH`** and **`CREATE_QDRANT_COLLECTION`** UDFs to ingest data that
-already lives in Exasol tables — the UDFs embed each row using Ollama and upsert
-the resulting vectors into Qdrant so you can later run semantic search via the
-virtual schema.
+**`EMBED_AND_PUSH_V2`** (recommended), **`EMBED_AND_PUSH`** (legacy), and
+**`CREATE_QDRANT_COLLECTION`** UDFs to ingest data that already lives in Exasol
+tables — the UDFs embed each row using Ollama and upsert the resulting vectors
+into Qdrant so you can later run semantic search via the virtual schema.
 
 ## Overview
 
@@ -41,23 +41,16 @@ Semantic search results back in Exasol SQL
 
 ## Docker Networking Note
 
-The UDFs run inside the Exasol container. Use Docker container IPs, not `localhost`:
+The UDFs run inside the Exasol container. Use the Docker bridge gateway IP (`172.17.0.1`) for **all** services — not `localhost`, and not individual container IPs.
 
 ```bash
-# Find the gateway IP (used to reach Qdrant from inside Exasol)
+# Find the gateway IP
 docker exec exasoldb ip route show default
 # → default via 172.17.0.1 dev eth0
-
-# Find Ollama's container IP
-docker inspect ollama --format '{{json .NetworkSettings.Networks}}'
-# → "IPAddress":"172.17.0.4"
-
-# Find Qdrant's container IP
-docker inspect qdrant --format '{{json .NetworkSettings.Networks}}'
-# → "IPAddress":"172.17.0.3"
+# Use 172.17.0.1 for BOTH qdrant_url and ollama_url
 ```
 
-Use `172.17.0.1` as the Qdrant host (traffic is forwarded via the gateway to the mapped port) and the Ollama container IP directly (e.g. `172.17.0.4`) for the `embedding_key` parameter.
+You do NOT need individual container IPs. The bridge gateway IP works for everything because Docker forwards traffic to the correct containers via published ports.
 
 ---
 
@@ -115,6 +108,74 @@ Supported distance metrics: `Cosine`, `Dot`, `Euclid`, `Manhattan`.
 
 Only two columns are needed: an ID column and a text column. All other columns are ignored during ingestion.
 
+### EMBED_AND_PUSH_V2 (recommended — CONNECTION-based)
+
+Simplified 4-parameter UDF that reads infrastructure config from a CONNECTION object. Credentials never appear in SQL text or audit logs.
+
+```sql
+-- The embedding_conn CONNECTION is created by install_all.sql.
+-- If you need a custom one:
+CREATE OR REPLACE CONNECTION my_embedding_conn TO '{
+    "qdrant_url": "http://172.17.0.1:6333",
+    "ollama_url": "http://172.17.0.1:11434",
+    "provider": "ollama",
+    "model": "nomic-embed-text"
+}';
+
+SELECT ADAPTER.EMBED_AND_PUSH_V2(
+    'embedding_conn',                   -- connection name
+    'my_articles',                      -- Qdrant collection
+    CAST("id" AS VARCHAR(255)),         -- unique ID
+    "text"                              -- text to embed
+)
+FROM MY_SCHEMA.MY_TABLE
+GROUP BY IPROC();
+```
+
+`GROUP BY IPROC()` distributes the work across Exasol cluster nodes. The UDF returns one summary row per node: `(partition_id, upserted_count)`.
+
+> **Timing:** Embedding speed depends on dataset size and model. Expect ~1–2 rows/second
+> with Ollama on CPU. For 544 rows, expect 30–60 seconds. The query will appear to "hang"
+> until all embeddings are computed — this is normal.
+
+### EMBED_AND_PUSH_V2 parameters
+
+| # | Parameter | Description |
+|---|---|---|
+| 1 | `connection_name` | Name of an Exasol CONNECTION object containing config JSON |
+| 2 | `collection` | Target Qdrant collection name |
+| 3 | `id` | Source row identifier — stored as Qdrant payload field `_original_id` |
+| 4 | `text` | Text to embed — stored as payload field `text` |
+
+### CONNECTION config JSON fields
+
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `qdrant_url` | Yes | -- | Full Qdrant URL (e.g. `http://172.17.0.1:6333`) |
+| `ollama_url` | Yes (for Ollama) | -- | Full Ollama URL (e.g. `http://172.17.0.1:11434`) |
+| `provider` | Yes | -- | `ollama` or `openai` |
+| `model` | Yes | -- | Embedding model name |
+| `batch_size` | No | `100` | Number of texts to embed per API call. Lower for large texts, higher for throughput. |
+| `max_chars` | No | `6000` | Max characters per text before truncation (~1500 tokens for nomic-embed-text). |
+
+Example CONNECTION with tuning:
+
+```sql
+CREATE OR REPLACE CONNECTION embedding_conn
+    TO '{"qdrant_url":"http://172.17.0.1:6333","ollama_url":"http://172.17.0.1:11434","provider":"ollama","model":"nomic-embed-text","batch_size":50,"max_chars":4000}'
+    USER '' IDENTIFIED BY '';
+```
+
+---
+
+### EMBED_AND_PUSH (legacy — 9 positional parameters)
+
+> **Security Warning:** This UDF passes API keys as plain-text SQL parameters. These values
+> appear **verbatim** in Exasol's audit log (`EXA_DBA_AUDIT_SQL`). Anyone with SELECT access
+> to audit tables can harvest your credentials. **Always prefer `EMBED_AND_PUSH_V2` above.**
+
+The original UDF is still available for backward compatibility:
+
 ```sql
 SELECT ADAPTER.EMBED_AND_PUSH(
     "new_id",                    -- id column
@@ -124,14 +185,12 @@ SELECT ADAPTER.EMBED_AND_PUSH(
     '',                          -- qdrant_api_key
     'my_articles',               -- collection name
     'ollama',                    -- provider ('ollama' or 'openai')
-    'http://172.17.0.4:11434',   -- embedding_key = Ollama base URL when provider='ollama'
+    'http://172.17.0.1:11434',   -- embedding_key = Ollama base URL when provider='ollama'
     'nomic-embed-text'           -- model name
 )
 FROM MY_SCHEMA.MY_TABLE
 GROUP BY IPROC();
 ```
-
-`GROUP BY IPROC()` distributes the work across Exasol cluster nodes. The UDF returns one summary row per node: `(partition_id, upserted_count)`.
 
 ### EMBED_AND_PUSH parameters
 
@@ -144,14 +203,14 @@ GROUP BY IPROC();
 | 5 | `qdrant_api_key` | Qdrant API key, or `''` |
 | 6 | `collection` | Target collection name |
 | 7 | `provider` | `'ollama'` for local Ollama embeddings, `'openai'` for OpenAI API |
-| 8 | `embedding_key` | **Ollama**: full base URL (e.g. `'http://172.17.0.4:11434'`). **OpenAI**: API key (`'sk-...'`) |
+| 8 | `embedding_key` | **Ollama**: full base URL (e.g. `'http://172.17.0.1:11434'`). **OpenAI**: API key (`'sk-...'`) |
 | 9 | `model_name` | Embedding model (e.g. `'nomic-embed-text'`, `'text-embedding-3-small'`) |
 
 ### Provider behaviour
 
 | Provider | `embedding_key` value | Notes |
 |---|---|---|
-| `'ollama'` | Ollama base URL, e.g. `'http://172.17.0.4:11434'` | Uses container IP — not `localhost` |
+| `'ollama'` | Ollama base URL, e.g. `'http://172.17.0.1:11434'` | Use the Docker bridge gateway IP — not `localhost` |
 | `'openai'` | OpenAI API key `'sk-...'` | Requires internet access from Exasol |
 
 ---
@@ -188,8 +247,10 @@ LIMIT 10;
 
 ## Security Note — Secrets in SQL
 
-Passing API keys or URLs as SQL string literals means they may appear in:
+**Use `EMBED_AND_PUSH_V2`** (CONNECTION-based) to keep credentials out of SQL text. Exasol redacts CONNECTION contents as `<SECRET>` in audit logs.
+
+The legacy `EMBED_AND_PUSH` passes API keys as SQL string literals, which means they appear in:
 - Exasol audit logs (`EXA_DBA_AUDIT_SQL`)
 - SQL client history files
 
-**Mitigations:** restrict access to audit log views with `GRANT`/`REVOKE`, and rotate credentials regularly.
+**Mitigations for legacy UDF:** restrict access to audit log views with `GRANT`/`REVOKE`, and rotate credentials regularly.

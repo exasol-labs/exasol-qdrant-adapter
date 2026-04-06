@@ -1,4 +1,7 @@
 CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
+-- Adapter version: update this on each release for deployment tracking.
+local ADAPTER_VERSION = "2.1.0"
+
 local cjson = require("cjson")
 local http  = require("socket.http")
 local ltn12 = require("ltn12")
@@ -65,23 +68,35 @@ local function esc(s) return (s or ""):gsub("'", "''") end
 
 local function rewrite(req, props)
     local url, key = resolve(props)
-    local ollama = (props.OLLAMA_URL and props.OLLAMA_URL ~= "") and props.OLLAMA_URL or "http://localhost:11434"
+    assert(props.OLLAMA_URL and props.OLLAMA_URL ~= "", "OLLAMA_URL property is not set. Set it to your Ollama endpoint reachable from inside Exasol (e.g. 'http://172.17.0.1:11434' for Docker bridge). Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.")
+    local ollama = props.OLLAMA_URL
     local pdr = req.pushdownRequest or {}
     local col = (((req.involvedTables or {})[1]) or {}).name
     assert(col, "no involved table in involvedTables")
     col = col:lower()
     local qtext = ""
     local f = pdr.filter
+    local unsupported_filter = false
     if f and f.type == "predicate_equal" then
         local l, r = f.left or {}, f.right or {}
         if l.type == "column" and l.name:upper() == "QUERY" and r.type == "literal_string" then
             qtext = r.value
         elseif r.type == "column" and r.name:upper() == "QUERY" and l.type == "literal_string" then
             qtext = l.value
+        else
+            unsupported_filter = true
         end
+    elseif f then
+        unsupported_filter = true
     end
     if qtext == "" then
-        return "SELECT * FROM VALUES (CAST('NO_QUERY' AS VARCHAR(2000000) UTF8), CAST('Semantic search requires: WHERE \"QUERY\" = ''your search text''. Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema." .. col .. " WHERE \"QUERY\" = ''your search'' LIMIT 10' AS VARCHAR(2000000) UTF8), CAST(0 AS DOUBLE), CAST('' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"
+        local hint_text
+        if unsupported_filter then
+            hint_text = "Unsupported predicate. Only WHERE \"QUERY\" = ''your search text'' is supported. LIKE, >, <, AND, OR are not supported. Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema." .. col .. " WHERE \"QUERY\" = ''your search'' LIMIT 10"
+        else
+            hint_text = "Semantic search requires: WHERE \"QUERY\" = ''your search text''. Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema." .. col .. " WHERE \"QUERY\" = ''your search'' LIMIT 10"
+        end
+        return "SELECT * FROM VALUES (CAST('HINT' AS VARCHAR(2000000) UTF8), CAST('" .. hint_text .. "' AS VARCHAR(2000000) UTF8), CAST(1 AS DOUBLE), CAST('Only equality predicates on QUERY are supported: WHERE \"QUERY\" = ''your text''' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"
     end
     local limit = (pdr.limit and pdr.limit.numElements) and tonumber(pdr.limit.numElements) or 10
     local emb = http_post_json(ollama .. "/api/embeddings", {model=props.QDRANT_MODEL, prompt=qtext})

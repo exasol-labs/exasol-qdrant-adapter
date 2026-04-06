@@ -1,12 +1,11 @@
-"""Unit tests for embed_and_push.py — mocks OpenAI, sentence-transformers, and Qdrant."""
+"""Unit tests for embed_and_push.py — uses stdlib urllib (no qdrant_client, no openai SDK)."""
 
 import sys
 import os
-import types
+import json
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-# Make the exasol_udfs package importable without installing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'exasol_udfs'))
 
 import embed_and_push
@@ -49,107 +48,94 @@ def _make_ctx(rows, qdrant_host='localhost', qdrant_port=6333,
     return ctx
 
 
+def _mock_openai_response(vectors):
+    """Create a mock urllib response for OpenAI embeddings API."""
+    body = json.dumps({
+        "data": [{"embedding": v} for v in vectors]
+    }).encode()
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+def _mock_qdrant_upsert_response():
+    """Create a mock urllib response for Qdrant upsert."""
+    body = json.dumps({"result": True, "status": "ok"}).encode()
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
 # ---------------------------------------------------------------------------
-# Tests: OpenAI embedding provider
+# Tests: OpenAI embedding
 # ---------------------------------------------------------------------------
 
 class TestEmbedOpenAI(unittest.TestCase):
 
-    @patch('embed_and_push.OpenAI')
-    def test_embed_openai_returns_vectors(self, MockOpenAI):
-        fake_response = MagicMock()
-        fake_response.data = [MagicMock(embedding=[0.1, 0.2]), MagicMock(embedding=[0.3, 0.4])]
-        MockOpenAI.return_value.embeddings.create.return_value = fake_response
+    @patch('urllib.request.urlopen')
+    def test_embed_openai_returns_vectors(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_openai_response([[0.1, 0.2], [0.3, 0.4]])
 
-        result = embed_and_push._embed_openai(['hello', 'world'], 'sk-test', 'text-embedding-3-small')
+        result = embed_and_push._openai_embed(['hello', 'world'], 'sk-test', 'text-embedding-3-small')
 
         self.assertEqual(result, [[0.1, 0.2], [0.3, 0.4]])
-        MockOpenAI.return_value.embeddings.create.assert_called_once_with(
-            input=['hello', 'world'], model='text-embedding-3-small'
-        )
 
     @patch('embed_and_push.time.sleep')
-    @patch('embed_and_push.OpenAI')
-    def test_embed_openai_retries_on_rate_limit(self, MockOpenAI, mock_sleep):
-        from openai import RateLimitError
+    @patch('urllib.request.urlopen')
+    def test_embed_openai_retries_on_rate_limit(self, mock_urlopen, mock_sleep):
+        import urllib.error
 
-        fake_response = MagicMock()
-        fake_response.data = [MagicMock(embedding=[0.5])]
+        rate_limit_resp = MagicMock()
+        rate_limit_resp.code = 429
+        rate_limit_resp.read.return_value = b'rate limited'
 
-        # Fail twice, then succeed
-        MockOpenAI.return_value.embeddings.create.side_effect = [
-            RateLimitError('rate limited', response=MagicMock(), body={}),
-            RateLimitError('rate limited', response=MagicMock(), body={}),
-            fake_response,
+        mock_urlopen.side_effect = [
+            urllib.error.HTTPError(url='', code=429, msg='', hdrs=None,
+                                  fp=MagicMock(read=MagicMock(return_value=b'rate limited'))),
+            urllib.error.HTTPError(url='', code=429, msg='', hdrs=None,
+                                  fp=MagicMock(read=MagicMock(return_value=b'rate limited'))),
+            _mock_openai_response([[0.5]]),
         ]
 
-        result = embed_and_push._embed_openai(['text'], 'sk-test', 'text-embedding-3-small')
+        result = embed_and_push._openai_embed(['text'], 'sk-test', 'text-embedding-3-small')
         self.assertEqual(result, [[0.5]])
         self.assertEqual(mock_sleep.call_count, 2)
 
-    @patch('embed_and_push.OpenAI')
-    def test_embed_openai_raises_after_max_retries(self, MockOpenAI):
-        from openai import RateLimitError
+    @patch('urllib.request.urlopen')
+    def test_embed_openai_raises_after_max_retries(self, mock_urlopen):
+        import urllib.error
 
-        MockOpenAI.return_value.embeddings.create.side_effect = RateLimitError(
-            'rate limited', response=MagicMock(), body={}
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url='', code=429, msg='', hdrs=None,
+            fp=MagicMock(read=MagicMock(return_value=b'rate limited'))
         )
 
         with self.assertRaises(RuntimeError) as ctx:
-            embed_and_push._embed_openai(['text'], 'sk-test', 'text-embedding-3-small')
+            embed_and_push._openai_embed(['text'], 'sk-test', 'text-embedding-3-small')
 
-        self.assertIn('3 attempts', str(ctx.exception))
-
-
-# ---------------------------------------------------------------------------
-# Tests: local sentence-transformers provider
-# ---------------------------------------------------------------------------
-
-class TestEmbedLocal(unittest.TestCase):
-
-    def test_embed_local_returns_vectors(self):
-        import numpy as np
-
-        mock_model = MagicMock()
-        mock_model.encode.return_value = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
-
-        with patch('embed_and_push.SentenceTransformer', return_value=mock_model):
-            result = embed_and_push._embed_local(['a', 'b'], 'all-MiniLM-L6-v2')
-
-        self.assertEqual(result, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
-        mock_model.encode.assert_called_once_with(
-            ['a', 'b'], convert_to_numpy=True, show_progress_bar=False
-        )
+        # On max retries, it raises with the HTTP error (429)
+        self.assertIn('429', str(ctx.exception))
 
 
 # ---------------------------------------------------------------------------
-# Tests: Qdrant upsert logic
+# Tests: UUID generation
 # ---------------------------------------------------------------------------
 
-class TestUpsertBatch(unittest.TestCase):
+class TestTextToUuid(unittest.TestCase):
 
-    def test_upsert_batch_calls_client(self):
-        mock_client = MagicMock()
-        ids     = ['id-1', 'id-2']
-        texts   = ['hello', 'world']
-        vectors = [[0.1, 0.2], [0.3, 0.4]]
+    def test_stable_uuid(self):
+        uuid1 = embed_and_push._text_to_uuid('doc-1')
+        uuid2 = embed_and_push._text_to_uuid('doc-1')
+        self.assertEqual(uuid1, uuid2)
 
-        embed_and_push._upsert_batch(mock_client, 'my_col', ids, texts, vectors)
-
-        mock_client.upsert.assert_called_once()
-        args = mock_client.upsert.call_args
-        self.assertEqual(args.kwargs['collection_name'], 'my_col')
-        points = args.kwargs['points']
-        self.assertEqual(len(points), 2)
-        self.assertEqual(points[0].payload, {'id': 'id-1', 'text': 'hello'})
-        self.assertEqual(points[0].vector, [0.1, 0.2])
-
-    def test_upsert_batch_uses_stable_uuid(self):
-        mock_client = MagicMock()
-        embed_and_push._upsert_batch(mock_client, 'col', ['doc-1'], ['x'], [[0.0]])
-        point_id = mock_client.upsert.call_args.kwargs['points'][0].id
-        # Same id should produce same UUID
-        self.assertEqual(point_id, embed_and_push._text_to_uuid('doc-1'))
+    def test_different_ids_different_uuids(self):
+        uuid1 = embed_and_push._text_to_uuid('doc-1')
+        uuid2 = embed_and_push._text_to_uuid('doc-2')
+        self.assertNotEqual(uuid1, uuid2)
 
 
 # ---------------------------------------------------------------------------
@@ -158,48 +144,66 @@ class TestUpsertBatch(unittest.TestCase):
 
 class TestRun(unittest.TestCase):
 
-    @patch('embed_and_push.QdrantClient')
-    @patch('embed_and_push._generate_embeddings')
-    def test_run_batches_and_emits(self, mock_embed, MockQdrant):
+    @patch('urllib.request.urlopen')
+    def test_run_batches_and_emits(self, mock_urlopen):
         rows = [(f'id-{i}', f'text {i}') for i in range(5)]
         ctx = _make_ctx(rows)
-        mock_embed.return_value = [[float(i)] * 3 for i in range(5)]
+
+        # First call: OpenAI embed, second call: Qdrant upsert
+        mock_urlopen.side_effect = [
+            _mock_openai_response([[float(i)] * 3 for i in range(5)]),
+            _mock_qdrant_upsert_response(),
+        ]
 
         embed_and_push.run(ctx)
 
-        # One batch (5 rows < 100)
-        mock_embed.assert_called_once()
-        MockQdrant.return_value.upsert.assert_called_once()
         ctx.emit.assert_called_once()
         _, upserted = ctx.emit.call_args[0]
         self.assertEqual(upserted, 5)
 
-    @patch('embed_and_push.QdrantClient')
-    @patch('embed_and_push._generate_embeddings')
-    def test_run_splits_into_multiple_batches(self, mock_embed, MockQdrant):
+    @patch('urllib.request.urlopen')
+    def test_run_splits_into_multiple_batches(self, mock_urlopen):
         rows = [(f'id-{i}', f'text {i}') for i in range(250)]
         ctx = _make_ctx(rows)
-        mock_embed.side_effect = lambda texts, *a, **kw: [[0.1] * 3] * len(texts)
+
+        # 3 batches: embed+upsert for each
+        responses = []
+        for batch_size in [100, 100, 50]:
+            responses.append(_mock_openai_response([[0.1] * 3] * batch_size))
+            responses.append(_mock_qdrant_upsert_response())
+        mock_urlopen.side_effect = responses
 
         embed_and_push.run(ctx)
 
-        # 250 rows → 3 batches (100+100+50)
-        self.assertEqual(mock_embed.call_count, 3)
         _, upserted = ctx.emit.call_args[0]
         self.assertEqual(upserted, 250)
 
-    @patch('embed_and_push.QdrantClient')
-    @patch('embed_and_push._generate_embeddings')
-    def test_run_raises_on_qdrant_error(self, mock_embed, MockQdrant):
+    @patch('urllib.request.urlopen')
+    def test_run_raises_on_qdrant_error(self, mock_urlopen):
+        import urllib.error
+
         rows = [('id-1', 'text')]
         ctx = _make_ctx(rows)
-        mock_embed.return_value = [[0.1]]
-        MockQdrant.return_value.upsert.side_effect = Exception('Qdrant down')
+
+        mock_urlopen.side_effect = [
+            _mock_openai_response([[0.1]]),
+            urllib.error.HTTPError(url='', code=500, msg='', hdrs=None,
+                                  fp=MagicMock(read=MagicMock(return_value=b'server error'))),
+        ]
 
         with self.assertRaises(RuntimeError) as exc_ctx:
             embed_and_push.run(ctx)
 
-        self.assertIn('Qdrant upsert failed', str(exc_ctx.exception))
+        self.assertIn('Qdrant', str(exc_ctx.exception))
+
+    def test_run_rejects_unsupported_provider(self):
+        rows = [('id-1', 'text')]
+        ctx = _make_ctx(rows, provider='local')
+
+        with self.assertRaises(ValueError) as exc_ctx:
+            embed_and_push.run(ctx)
+
+        self.assertIn('Unsupported provider', str(exc_ctx.exception))
 
 
 if __name__ == '__main__':

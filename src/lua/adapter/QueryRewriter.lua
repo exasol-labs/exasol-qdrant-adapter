@@ -31,6 +31,12 @@ function QueryRewriter:rewrite(request)
     local query_text = self:_extract_query_text(request)
     local limit      = self:_extract_limit(request)
 
+    -- Graceful empty-query handling: if no WHERE "QUERY" = '...' clause was
+    -- provided, return a single-row hint instead of crashing on Ollama.
+    if query_text == nil or query_text == "" then
+        return self:_build_empty_query_hint(collection)
+    end
+
     local embedding = self:_embed(query_text)
     local results   = self:_search(collection, embedding, limit)
 
@@ -151,6 +157,25 @@ end
 
 -- ─────────────────────────────────────────────
 -- SQL builders
+
+--- Returns a single-row hint when no query text was provided.
+-- Sets SCORE=1 and QUERY to a descriptive string so the hint row
+-- survives post-pushdown filtering (e.g. WHERE SCORE > 0.5 or LIKE).
+function QueryRewriter:_build_empty_query_hint(collection)
+    local hint = "Semantic search requires: WHERE \"QUERY\" = 'your search text'."
+        .. " Only equality predicates on QUERY are supported (no LIKE, >, <, AND, OR)."
+        .. " Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema."
+        .. collection .. " WHERE \"QUERY\" = 'your search' LIMIT 10"
+    hint = hint:gsub("'", "''")
+    local query_hint = "Only equality predicates on QUERY are supported: WHERE \"QUERY\" = 'your text'"
+    query_hint = query_hint:gsub("'", "''")
+    return "SELECT * FROM VALUES"
+        .. " (CAST('HINT' AS VARCHAR(2000000) UTF8),"
+        .. " CAST('" .. hint .. "' AS VARCHAR(2000000) UTF8),"
+        .. " CAST(1 AS DOUBLE),"
+        .. " CAST('" .. query_hint .. "' AS VARCHAR(2000000) UTF8))"
+        .. " AS t(ID, TEXT, SCORE, QUERY)"
+end
 
 local function sql_escape(s)
     return (s or ""):gsub("'", "''")

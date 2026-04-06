@@ -9,12 +9,14 @@ AdapterProperties.__index = AdapterProperties
 setmetatable(AdapterProperties, {__index = base_props})
 
 -- Property key constants
-AdapterProperties.CONNECTION_NAME = "CONNECTION_NAME"
-AdapterProperties.QDRANT_MODEL    = "QDRANT_MODEL"
-AdapterProperties.OLLAMA_URL      = "OLLAMA_URL"
-AdapterProperties.QDRANT_URL      = "QDRANT_URL"
+AdapterProperties.CONNECTION_NAME    = "CONNECTION_NAME"
+AdapterProperties.QDRANT_MODEL      = "QDRANT_MODEL"
+AdapterProperties.OLLAMA_URL        = "OLLAMA_URL"
+AdapterProperties.QDRANT_URL        = "QDRANT_URL"
+AdapterProperties.COLLECTION_FILTER = "COLLECTION_FILTER"
 
-local DEFAULT_OLLAMA_URL = "http://localhost:11434"
+-- No default for OLLAMA_URL — localhost never works inside Docker.
+-- Users must set it explicitly (typically to the Docker bridge gateway IP).
 
 --- Creates a new AdapterProperties instance.
 -- @param raw table  Raw properties map (string → string), or nil for an empty set.
@@ -29,14 +31,20 @@ end
 --- Validates that all required properties are present and non-empty.
 -- Raises an error with an actionable message on the first missing property.
 function AdapterProperties:validate()
-    local function require_property(key)
+    local function require_property(key, hint)
         local val = self:get(key)
         if val == nil or val == "" then
-            error(("Required virtual schema property '%s' is missing or empty."):format(key), 2)
+            local msg = ("Required virtual schema property '%s' is missing or empty."):format(key)
+            if hint then msg = msg .. " " .. hint end
+            error(msg, 2)
         end
     end
     require_property(self.CONNECTION_NAME)
     require_property(self.QDRANT_MODEL)
+    require_property(self.OLLAMA_URL,
+        "Set OLLAMA_URL to your Ollama endpoint reachable from inside Exasol "
+        .. "(e.g. 'http://172.17.0.1:11434' for Docker bridge). "
+        .. "Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.")
 end
 
 --- Returns the value of the named property, or nil if absent.
@@ -54,11 +62,23 @@ function AdapterProperties:get_qdrant_model()
     return self:get(self.QDRANT_MODEL)
 end
 
---- Returns the Ollama base URL, defaulting to http://localhost:11434 if not set.
+--- Returns the Ollama base URL.
+-- Raises an error if not set (no default — localhost never works in Docker).
 function AdapterProperties:get_ollama_url()
     local val = self:get(self.OLLAMA_URL)
     if val and val ~= "" then return val end
-    return DEFAULT_OLLAMA_URL
+    error("OLLAMA_URL property is not set. "
+        .. "Set it to your Ollama endpoint reachable from inside Exasol "
+        .. "(e.g. 'http://172.17.0.1:11434' for Docker bridge). "
+        .. "Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.", 2)
+end
+
+--- Returns the COLLECTION_FILTER value, or nil if not set.
+-- Comma-separated list of collection names or glob patterns (e.g. "bank_*,products").
+function AdapterProperties:get_collection_filter()
+    local val = self:get(self.COLLECTION_FILTER)
+    if val and val ~= "" then return val end
+    return nil
 end
 
 --- Returns an explicit Qdrant URL override, or nil if not set.

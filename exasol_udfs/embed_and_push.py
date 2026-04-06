@@ -1,6 +1,11 @@
 """
 Exasol SET UDF: EMBED_AND_PUSH
 
+DEPRECATED: This UDF passes API keys as plain-text SQL parameters, which
+appear verbatim in Exasol's audit log (EXA_DBA_AUDIT_SQL). Use
+EMBED_AND_PUSH_V2 instead, which reads credentials from a CONNECTION
+object where passwords are redacted as <SECRET> in audit logs.
+
 Reads text rows from an Exasol table, calls the OpenAI embeddings API,
 and upserts the resulting vectors into Qdrant in batches of 100.
 
@@ -44,7 +49,11 @@ def _openai_embed(texts, api_key, model):
                 delay *= 2
                 continue
             raise RuntimeError(
-                f"OpenAI API error {status} (attempt {attempt}/{MAX_RETRIES}): {body}"
+                f"OpenAI HTTP {status} from {url}: {body}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"Connection to OpenAI at {url} failed: {e.reason}"
             ) from e
     raise RuntimeError(f"OpenAI embedding failed after {MAX_RETRIES} attempts")
 
@@ -80,7 +89,11 @@ def _qdrant_upsert(base_url, collection, ids, texts, vectors, api_key):
                 raise RuntimeError(f"Qdrant upsert returned non-ok status: {result}")
     except urllib.error.HTTPError as e:
         raise RuntimeError(
-            f"Qdrant upsert HTTP {e.code}: {e.read().decode()}"
+            f"Qdrant HTTP {e.code} from {url}: {e.read().decode()}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Connection to Qdrant at {url} failed: {e.reason}"
         ) from e
 
 

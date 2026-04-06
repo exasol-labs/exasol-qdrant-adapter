@@ -80,6 +80,19 @@ Always quote column names with double quotes to avoid Exasol reserved word confl
 
 > **Default limit:** When `LIMIT` is omitted, the adapter returns at most **10 results**.
 
+### SCORE filtering
+
+You can filter results by relevance score. Exasol applies SCORE filters after the vector search:
+
+```sql
+SELECT "ID", "TEXT", "SCORE" FROM vector_schema.articles
+WHERE "QUERY" = 'machine learning' AND "SCORE" > 0.6 LIMIT 5;
+```
+
+### Performance note
+
+Each query takes approximately **5–8 seconds**. This latency is dominated by Exasol's Lua sandbox initialization (~80% of total time), not by the embedding or vector search (~150ms combined). For sub-second latency, query Ollama and Qdrant directly via their HTTP APIs.
+
 ---
 
 ## Using search results in downstream SQL
@@ -103,10 +116,11 @@ ORDER BY s."SCORE" DESC;
 
 | Property          | Required | Default                  | Description                                      |
 | ----------------- | -------- | ------------------------ | ------------------------------------------------ |
-| `CONNECTION_NAME` | Yes      | --                       | Exasol CONNECTION object with Qdrant URL         |
-| `QDRANT_MODEL`    | Yes      | --                       | Ollama model name for embeddings                 |
-| `OLLAMA_URL`      | No       | `http://localhost:11434` | Ollama base URL reachable from Exasol            |
-| `QDRANT_URL`      | No       | --                       | Override Qdrant URL (ignores CONNECTION address)  |
+| `CONNECTION_NAME`   | Yes      | --                       | Exasol CONNECTION object with Qdrant URL         |
+| `QDRANT_MODEL`      | Yes      | --                       | Ollama model name for embeddings                 |
+| `OLLAMA_URL`        | Yes      | --                       | Ollama base URL reachable from Exasol (e.g. `http://172.17.0.1:11434` for Docker) |
+| `QDRANT_URL`        | No       | --                       | Override Qdrant URL (ignores CONNECTION address)  |
+| `COLLECTION_FILTER` | No       | -- (all collections)     | Comma-separated list of collection names or glob patterns to expose |
 
 Change properties without dropping the schema:
 
