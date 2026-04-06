@@ -171,7 +171,31 @@ LIMIT 5;
 > (e.g., 544 rows), expect 30–60 seconds. The query will appear to "hang" until
 > all embeddings are computed and uploaded — this is normal.
 
-> **Tip:** For a larger dataset, use `MUFA.SEMANTIC` (544 US bank failure records). See the [CLAUDE.md](CLAUDE.md) file for ingestion commands and example queries.
+> **Tip:** To ingest your own Exasol table, replace the placeholders below:
+>
+> ```sql
+> -- 1. Create a collection for your data
+> SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
+>     '172.17.0.1', 6333, '', 'my_collection', 768, 'Cosine', ''
+> );
+>
+> -- 2. Embed and push rows from your table
+> SELECT ADAPTER.EMBED_AND_PUSH_V2(
+>     'embedding_conn',
+>     'my_collection',
+>     CAST(id_column AS VARCHAR(36)),
+>     text_column
+> )
+> FROM MY_SCHEMA.MY_TABLE
+> GROUP BY IPROC();
+>
+> -- 3. Refresh and query
+> ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+> SELECT "ID", "TEXT", "SCORE"
+> FROM vector_schema.my_collection
+> WHERE "QUERY" = 'your search query'
+> LIMIT 5;
+> ```
 
 ---
 
@@ -376,10 +400,10 @@ ORDER BY s."SCORE" DESC;
 > **Accessing additional metadata:** The virtual schema returns a fixed 4-column schema. To access additional fields from your source data, JOIN the search results with your original table using the ID column:
 >
 > ```sql
-> SELECT s."TEXT", s."SCORE", m."City", m."State"
-> FROM vector_schema.bank_failures s
-> JOIN MUFA.SEMANTIC m ON s."ID" = CAST(ROWNUM AS VARCHAR(36))
-> WHERE s."QUERY" = 'banks in California'
+> SELECT s."TEXT", s."SCORE", m.category, m.author
+> FROM vector_schema.my_collection s
+> JOIN MY_SCHEMA.MY_TABLE m ON s."ID" = CAST(m.id_column AS VARCHAR(36))
+> WHERE s."QUERY" = 'your search query'
 > LIMIT 5;
 > ```
 
@@ -392,8 +416,8 @@ ORDER BY s."SCORE" DESC;
 > **SCORE filtering:** You can filter by relevance score using standard SQL. Exasol applies SCORE filters after the vector search:
 >
 > ```sql
-> SELECT "ID", "TEXT", "SCORE" FROM vector_schema.bank_failures
-> WHERE "QUERY" = 'large bank failures' AND "SCORE" > 0.6 LIMIT 5;
+> SELECT "ID", "TEXT", "SCORE" FROM vector_schema.my_collection
+> WHERE "QUERY" = 'your search query' AND "SCORE" > 0.6 LIMIT 5;
 > ```
 
 ### Performance Note
