@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/exasol-qdrant-banner.png" alt="Exasol Qdrant Adapter — Semantic similarity search in pure SQL" />
+</p>
+
 # Exasol Qdrant Vector Search Adapter
 
 A Virtual Schema adapter that brings semantic similarity search into Exasol SQL using [Qdrant](https://qdrant.tech/) as the vector store and [Ollama](https://ollama.com/) for local text embeddings.

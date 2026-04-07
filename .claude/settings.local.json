@@ -173,7 +173,9 @@
       "Bash(sed -n '279,351p' /tmp/lua_adapter.sql)",
       "Bash(sed -n '279,351p' scripts/install_all.sql)",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Status: {d[\\\\\"status\\\\\"]}, Vectors: {d[\\\\\"result\\\\\"][\\\\\"points_count\\\\\"]}'\\)\")",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Vectors: {d[\\\\\"result\\\\\"][\\\\\"points_count\\\\\"]}'\\)\")"
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Vectors: {d[\\\\\"result\\\\\"][\\\\\"points_count\\\\\"]}'\\)\")",
+      "Bash(mkdir -p C:/Users/mufa/documents/exasol-quadrant-adapter/assets)",
+      "Bash(cp \"C:/Users/mufa/Downloads/exasol-qdrant-art-pack/exasol-qdrant-banner.png\" C:/Users/mufa/documents/exasol-quadrant-adapter/assets/exasol-qdrant-banner.png)"
     ]
   }
 }
