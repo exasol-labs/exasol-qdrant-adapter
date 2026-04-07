@@ -54,6 +54,16 @@ def _mock_create_response():
     return resp
 
 
+def _mock_index_response():
+    """Create a mock urllib response for PUT /collections/<name>/index."""
+    body = json.dumps({"result": {"operation_id": 1, "status": "acknowledged"}, "status": "ok"}).encode()
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Tests: collection does not exist -> created
 # ---------------------------------------------------------------------------
@@ -64,16 +74,18 @@ class TestCollectionCreated(unittest.TestCase):
     def test_creates_collection_when_not_exists(self, mock_urlopen):
         # First call: GET /collections -> empty
         # Second call: PUT /collections/test_col -> ok
+        # Third call: PUT /collections/test_col/index -> ok (text index for hybrid search)
         mock_urlopen.side_effect = [
             _mock_qdrant_response([]),
-            _mock_create_response()
+            _mock_create_response(),
+            _mock_index_response(),
         ]
 
         ctx = _make_ctx()
         result = create_collection.run(ctx)
 
         self.assertEqual(result, 'created: test_col')
-        self.assertEqual(mock_urlopen.call_count, 2)
+        self.assertEqual(mock_urlopen.call_count, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +130,8 @@ class TestVectorSizeInference(unittest.TestCase):
     def test_infers_size_for_known_model(self, mock_urlopen):
         mock_urlopen.side_effect = [
             _mock_qdrant_response([]),
-            _mock_create_response()
+            _mock_create_response(),
+            _mock_index_response(),
         ]
 
         ctx = _make_ctx(vector_size=None, model_name='nomic-embed-text')

@@ -23,13 +23,14 @@ Virtual Schema Adapter (Lua, runs inside Exasol — no BucketFS, no JAR)
       ↓
 Ollama (local embeddings — text → float vector)
       ↓
-Qdrant (vector similarity search)
+Qdrant (hybrid search: vector similarity + keyword matching via RRF)
       ↓
 Ranked results back to Exasol
 ```
 
+- **Hybrid search** — combines vector similarity with keyword matching using Qdrant's Reciprocal Rank Fusion (RRF), so entity-specific queries like "acquired by JP Morgan" surface exact matches alongside semantically similar results
 - No pre-computed embeddings needed — the adapter calls Ollama automatically at query time
-- Results are ranked by cosine similarity score (0–1, higher = more similar)
+- Results are ranked by fused similarity score (higher = more relevant)
 - Works with any Ollama embedding model (default: `nomic-embed-text`)
 - Deployed as a single SQL statement — no Maven build, no BucketFS upload
 
@@ -40,15 +41,15 @@ Ranked results back to Exasol
 | Component | Version | Notes                               |
 | --------- | ------- | ----------------------------------- |
 | Exasol    | 7.x+    | Docker or on-premise                |
-| Qdrant    | 1.9+    | Docker recommended                  |
+| Qdrant    | 1.7+    | Docker recommended (1.7+ required for hybrid search) |
 | Ollama    | latest  | Must have `nomic-embed-text` pulled |
 
 **Dev-only** (only needed to rebuild `dist/adapter.lua` after source changes):
 
-| Tool       | Install                       |
-| ---------- | ----------------------------- |
-| Lua 5.4    | `brew install lua` / apt      |
-| lua-amalg  | `luarocks install amalg`      |
+| Tool                      | Install                                      |
+| ------------------------- | -------------------------------------------- |
+| Lua 5.4                   | `brew install lua` / apt                     |
+| lua-amalg                 | `luarocks install amalg`                     |
 | virtual-schema-common-lua | `luarocks install virtual-schema-common-lua` |
 
 ---
@@ -58,7 +59,7 @@ Ranked results back to Exasol
 ### 1. Start Exasol
 
 ```bash
-docker run -d --name exasoldb -p 8563:8563 --privileged exasol/docker-db:latest
+docker run --name exasoldb -p 127.0.0.1:9563:8563 --detach --privileged --stop-timeout 120  exasol/docker-db:latest
 ```
 
 Exasol takes about 90 seconds to initialize. Wait before connecting.
@@ -84,8 +85,8 @@ Open [`scripts/install_all.sql`](scripts/install_all.sql) in your SQL client (DB
 > **SQL client setup:** This file uses `/` (forward slash on its own line) as the
 > statement separator — not `;`. Configure your SQL client accordingly:
 >
-> - **DBeaver:** Open the file, then use *SQL Editor → Execute SQL Script* (Alt+X).
->   If it fails, go to *Window → Preferences → SQL Editor* and set the
+> - **DBeaver:** Open the file, then use _SQL Editor → Execute SQL Script_ (Alt+X).
+>   If it fails, go to _Window → Preferences → SQL Editor_ and set the
 >   "Script statement delimiter" to `/`.
 > - **DbVisualizer:** The `/` delimiter is supported by default when using
 >   "Execute as Script."
@@ -285,6 +286,11 @@ curl -X PUT 'http://localhost:6333/collections/articles' \
   -H 'Content-Type: application/json' \
   -d '{"vectors":{"text":{"size":768,"distance":"Cosine"}}}'
 
+# Create text payload index (required for hybrid search)
+curl -X PUT 'http://localhost:6333/collections/articles/index' \
+  -H 'Content-Type: application/json' \
+  -d '{"field_name":"text","field_schema":{"type":"text","tokenizer":"word","min_token_len":2,"max_token_len":40,"lowercase":true}}'
+
 # Get embedding from Ollama
 EMBEDDING=$(curl -s http://localhost:11434/api/embeddings \
   -d '{"model":"nomic-embed-text","prompt":"Machine learning is a subset of AI"}' \
@@ -327,6 +333,11 @@ Invoke-RestMethod -Method PUT -Uri 'http://localhost:6333/collections/articles' 
   -ContentType 'application/json' `
   -Body '{"vectors":{"text":{"size":768,"distance":"Cosine"}}}'
 
+# Create text payload index (required for hybrid search)
+Invoke-RestMethod -Method PUT -Uri 'http://localhost:6333/collections/articles/index' `
+  -ContentType 'application/json' `
+  -Body '{"field_name":"text","field_schema":{"type":"text","tokenizer":"word","min_token_len":2,"max_token_len":40,"lowercase":true}}'
+
 # Insert documents
 Add-Document "articles" "doc-1" "Machine learning is a subset of artificial intelligence"
 Add-Document "articles" "doc-2" "The Eiffel Tower is located in Paris, France"
@@ -357,6 +368,7 @@ SELECT ADAPTER.PREFLIGHT_CHECK(
 ```
 
 Returns a structured report:
+
 ```
 === PREFLIGHT CHECK: ALL CHECKS PASSED ===
 [PASS] Qdrant: reachable, 2 collection(s): articles, products
@@ -398,7 +410,7 @@ ORDER BY s."SCORE" DESC;
 | ------- | ------- | ---------------------------------------------- |
 | `ID`    | VARCHAR | Original document ID as inserted               |
 | `TEXT`  | VARCHAR | Original document text                         |
-| `SCORE` | DOUBLE  | Cosine similarity (0–1, higher = more similar) |
+| `SCORE` | DOUBLE  | Relevance score (higher = more relevant). With hybrid search, this is an RRF fusion score; with pure vector search, it is cosine similarity (0–1) |
 | `QUERY` | VARCHAR | The query string echoed back                   |
 
 > **Accessing additional metadata:** The virtual schema returns a fixed 4-column schema. To access additional fields from your source data, JOIN the search results with your original table using the ID column:
@@ -424,6 +436,43 @@ ORDER BY s."SCORE" DESC;
 > WHERE "QUERY" = 'your search query' AND "SCORE" > 0.6 LIMIT 5;
 > ```
 
+### Hybrid Search
+
+The adapter automatically combines vector similarity with keyword matching using Qdrant's [Reciprocal Rank Fusion (RRF)](https://qdrant.tech/documentation/concepts/hybrid-queries/). This significantly improves results for queries that reference specific names, places, or terms.
+
+**How it works:**
+
+1. Your query text is tokenized into keywords (stopwords like "the", "is", "in" are removed)
+2. Adjacent keywords are also combined into compound tokens (e.g., "JP" + "Morgan" also generates "jpmorgan") to match concatenated terms in source data
+3. The adapter sends multiple search legs to Qdrant in a single request:
+   - One **vector-only leg** (broad semantic search)
+   - One **keyword-filtered leg per keyword** (vector search narrowed to documents containing that keyword)
+4. Qdrant merges all legs using RRF, which naturally weights rare keywords higher than common ones
+
+**What this means in practice:**
+
+- **Entity-specific queries work** -- searching for "banks acquired by JP Morgan" surfaces results containing "JPMorgan" and "J.P. Morgan", not just generically similar text
+- **No configuration needed** -- hybrid search is the default behavior for all queries
+- **Graceful fallback** -- if the query contains only stopwords (e.g., "what is the"), the adapter falls back to pure vector search
+- **No performance penalty** -- all search legs execute in a single Qdrant API call
+
+**Requirements:**
+
+- **Qdrant 1.7+** (for text payload indexes and the prefetch/fusion query API)
+- A **text payload index** on the `text` field in each Qdrant collection
+
+Collections created via `CREATE_QDRANT_COLLECTION` (v2.2.0+) include the text index automatically. If you created collections via direct HTTP (Option B above), the curl/PowerShell examples include the index creation step.
+
+**Upgrading older collections:** If you have collections created before v2.2.0, add the text index manually (the adapter still works without it, but falls back to pure vector search):
+
+```bash
+curl -X PUT 'http://localhost:6333/collections/<name>/index' \
+  -H 'Content-Type: application/json' \
+  -d '{"field_name":"text","field_schema":{"type":"text","tokenizer":"word","min_token_len":2,"max_token_len":40,"lowercase":true}}'
+```
+
+> **Note:** Creating the index on an existing collection is safe and non-destructive. Qdrant indexes the data asynchronously in the background.
+
 ### Performance Note
 
 Each query takes approximately **5-8 seconds**. This latency is dominated by Exasol's Lua sandbox initialization (~80% of total time), not by the embedding or vector search (~150ms combined). This is a known characteristic of Exasol's UDF sandbox architecture.
@@ -434,10 +483,10 @@ For use cases requiring sub-second latency, consider querying Ollama and Qdrant 
 
 `EMBED_AND_PUSH_V2` reads optional tuning parameters from the CONNECTION config JSON:
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `batch_size` | `100` | Number of texts to embed per API call. Lower for large texts, higher for throughput. |
-| `max_chars` | `6000` | Max characters per text before truncation (~1500 tokens for nomic-embed-text). |
+| Key          | Default | Description                                                                          |
+| ------------ | ------- | ------------------------------------------------------------------------------------ |
+| `batch_size` | `100`   | Number of texts to embed per API call. Lower for large texts, higher for throughput. |
+| `max_chars`  | `6000`  | Max characters per text before truncation (~1500 tokens for nomic-embed-text).       |
 
 Example CONNECTION with tuning:
 
@@ -451,13 +500,13 @@ CREATE OR REPLACE CONNECTION embedding_conn
 
 ## Virtual Schema Properties
 
-| Property            | Required | Default                  | Description                                                        |
-| ------------------- | -------- | ------------------------ | ------------------------------------------------------------------ |
-| `CONNECTION_NAME`   | Yes      | —                        | Exasol CONNECTION object with Qdrant URL                           |
-| `QDRANT_MODEL`      | Yes      | —                        | Ollama model name for embeddings                                   |
-| `OLLAMA_URL`        | Yes      | —                        | Ollama base URL reachable from Exasol (e.g. `http://172.17.0.1:11434` for Docker) |
-| `QDRANT_URL`        | No       | —                        | Override Qdrant URL (ignores CONNECTION address)                   |
-| `COLLECTION_FILTER` | No       | — (all collections)      | Comma-separated list of collection names or glob patterns to expose |
+| Property            | Required | Default             | Description                                                                       |
+| ------------------- | -------- | ------------------- | --------------------------------------------------------------------------------- |
+| `CONNECTION_NAME`   | Yes      | —                   | Exasol CONNECTION object with Qdrant URL                                          |
+| `QDRANT_MODEL`      | Yes      | —                   | Ollama model name for embeddings                                                  |
+| `OLLAMA_URL`        | Yes      | —                   | Ollama base URL reachable from Exasol (e.g. `http://172.17.0.1:11434` for Docker) |
+| `QDRANT_URL`        | No       | —                   | Override Qdrant URL (ignores CONNECTION address)                                  |
+| `COLLECTION_FILTER` | No       | — (all collections) | Comma-separated list of collection names or glob patterns to expose               |
 
 Change properties without dropping the schema:
 
@@ -498,7 +547,8 @@ src/lua/
 │   ├── AdapterProperties.lua    # Property constants, validation, merge semantics
 │   ├── capabilities.lua         # Capability set declaration
 │   ├── MetadataReader.lua       # HTTP GET /collections → table metadata
-│   └── QueryRewriter.lua        # Ollama embed + Qdrant search + VALUES SQL builder
+│   ├── QueryRewriter.lua        # Hybrid search: Ollama embed + Qdrant RRF + VALUES SQL
+│   └── tokenizer.lua            # Keyword extraction for hybrid search filters
 └── util/
     └── http.lua                 # LuaSocket JSON GET/POST wrapper
 dist/
@@ -537,7 +587,7 @@ lua build/amalg.lua
 
 ## Known Limitations
 
-- **Semantic search only** -- no BM25 / keyword search. The adapter uses vector similarity exclusively. For hybrid search (semantic + keyword), query Qdrant directly or use a separate full-text search solution.
+- **Hybrid search requires Qdrant text index** -- collections created with `CREATE_QDRANT_COLLECTION` (v2.2.0+) include the text index automatically. For older collections, add the index manually (see [docs/limitations.md](docs/limitations.md)).
 - **Fixed 4-column schema** -- each virtual table exposes ID, TEXT, SCORE, QUERY. Custom Qdrant payload fields are not directly accessible (use JOINs as a workaround, see above).
 - **5-8 second query latency** -- dominated by Exasol's Lua sandbox initialization, not the search itself.
 - **Single vector field** -- the adapter searches the `text` vector field. Multi-vector collections are not supported.

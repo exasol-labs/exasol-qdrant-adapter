@@ -175,7 +175,13 @@
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Status: {d[\\\\\"status\\\\\"]}, Vectors: {d[\\\\\"result\\\\\"][\\\\\"points_count\\\\\"]}'\\)\")",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Vectors: {d[\\\\\"result\\\\\"][\\\\\"points_count\\\\\"]}'\\)\")",
       "Bash(mkdir -p C:/Users/mufa/documents/exasol-quadrant-adapter/assets)",
-      "Bash(cp \"C:/Users/mufa/Downloads/exasol-qdrant-art-pack/exasol-qdrant-banner.png\" C:/Users/mufa/documents/exasol-quadrant-adapter/assets/exasol-qdrant-banner.png)"
+      "Bash(cp \"C:/Users/mufa/Downloads/exasol-qdrant-art-pack/exasol-qdrant-banner.png\" C:/Users/mufa/documents/exasol-quadrant-adapter/assets/exasol-qdrant-banner.png)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Points: {d[\\\\\"result\\\\\"][\\\\\"points_count\\\\\"]}, Indexed: {d[\\\\\"result\\\\\"][\\\\\"indexed_vectors_count\\\\\"]}'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('Qdrant version check...'\\); print\\(json.dumps\\(d['result']['config']['params'], indent=2\\)\\)\")",
+      "Bash(python -m pytest tests/unit/ -v)",
+      "Bash(python -c \"import json,sys; [print\\(c['name']\\) for c in json.load\\(sys.stdin\\)['result']['collections']]\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f\\\\\"{len\\(d['result']['collections']\\)} collections\\\\\"\\)\")"
     ]
   }
 }

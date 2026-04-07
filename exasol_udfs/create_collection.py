@@ -78,11 +78,28 @@ def run(ctx):
     if collection in existing:
         return f"exists: {collection}"
 
-    # Create collection
+    # Create collection (named vector "text" for adapter compatibility)
     _qdrant_request(
         "PUT",
         f"{base_url}/collections/{collection}",
-        body={"vectors": {"size": vector_size, "distance": distance}},
+        body={"vectors": {"text": {"size": vector_size, "distance": distance}}},
+        api_key=api_key,
+    )
+
+    # Create text payload index for hybrid search (keyword + vector RRF fusion)
+    _qdrant_request(
+        "PUT",
+        f"{base_url}/collections/{collection}/index",
+        body={
+            "field_name": "text",
+            "field_schema": {
+                "type": "text",
+                "tokenizer": "word",
+                "min_token_len": 2,
+                "max_token_len": 40,
+                "lowercase": True,
+            },
+        },
         api_key=api_key,
     )
     return f"created: {collection}"

@@ -3,6 +3,7 @@
 -- Exasol can materialise as a result set.
 
 local http = require("util.http")
+local tokenizer = require("adapter.tokenizer")
 
 local QueryRewriter = {}
 QueryRewriter.__index = QueryRewriter
@@ -38,7 +39,7 @@ function QueryRewriter:rewrite(request)
     end
 
     local embedding = self:_embed(query_text)
-    local results   = self:_search(collection, embedding, limit)
+    local results   = self:_search(collection, embedding, limit, query_text)
 
     return self:_build_sql(query_text, results)
 end
@@ -129,7 +130,9 @@ local function embedding_to_json(embedding)
 end
 
 --- Calls Qdrant /collections/{name}/points/query and returns result rows.
-function QueryRewriter:_search(collection, vector, limit)
+-- Uses hybrid search (vector + keyword RRF fusion) when query_text
+-- contains meaningful keywords; falls back to pure vector search otherwise.
+function QueryRewriter:_search(collection, vector, limit, query_text)
     local url = string.format("%s/collections/%s/points/query",
                               self._qdrant_url, collection)
     local headers = {}
@@ -137,10 +140,16 @@ function QueryRewriter:_search(collection, vector, limit)
         headers["api-key"] = self._api_key
     end
 
-    local body = string.format(
-        '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
-        embedding_to_json(vector), limit
-    )
+    local emb_json = embedding_to_json(vector)
+    local keywords = tokenizer.extract_keywords(query_text or "")
+
+    local body
+    if #keywords > 0 then
+        body = self:_build_hybrid_body(emb_json, keywords, limit)
+    else
+        body = self:_build_vector_body(emb_json, limit)
+    end
+
     local response = http.post_raw(url, body, headers)
 
     local rows = {}
@@ -153,6 +162,46 @@ function QueryRewriter:_search(collection, vector, limit)
         }
     end
     return rows
+end
+
+--- Builds a pure vector query body (fallback when no keywords extracted).
+function QueryRewriter:_build_vector_body(emb_json, limit)
+    return string.format(
+        '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
+        emb_json, limit
+    )
+end
+
+--- Builds a hybrid prefetch + RRF fusion body.
+-- Creates one prefetch leg for pure vector search, plus one additional
+-- prefetch leg per keyword (each filtered to results containing that keyword).
+-- Qdrant fuses all rankings using Reciprocal Rank Fusion. This naturally
+-- weights rare keywords higher than ubiquitous ones: a keyword matching
+-- 3/544 documents produces a focused ranking that strongly boosts those
+-- documents, while a keyword matching 530/544 adds almost no signal.
+function QueryRewriter:_build_hybrid_body(emb_json, keywords, limit)
+    local vector_limit  = math.max(limit * 10, 50)
+    local keyword_limit = math.max(limit * 4, 20)
+
+    local legs = {}
+    -- Leg 1: pure vector search (broad)
+    legs[1] = string.format(
+        '{"query":%s,"using":"text","limit":%d}',
+        emb_json, vector_limit
+    )
+    -- One leg per keyword, each with a must filter
+    for _, kw in ipairs(keywords) do
+        local escaped = kw:gsub('"', '\\"')
+        legs[#legs + 1] = string.format(
+            '{"query":%s,"using":"text","limit":%d,"filter":{"must":[{"key":"text","match":{"text":"%s"}}]}}',
+            emb_json, keyword_limit, escaped
+        )
+    end
+
+    return string.format(
+        '{"prefetch":[%s],"query":{"fusion":"rrf"},"limit":%d,"with_payload":true}',
+        table.concat(legs, ","), limit
+    )
 end
 
 -- ─────────────────────────────────────────────

@@ -74,7 +74,7 @@ CREATE OR REPLACE CONNECTION qdrant_conn
 
 CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
 -- Adapter version: update this on each release for deployment tracking.
-local ADAPTER_VERSION = "2.1.0"
+local ADAPTER_VERSION = "2.2.0"
 
 local cjson = require("cjson")
 local http  = require("socket.http")
@@ -156,6 +156,50 @@ end
 
 local function esc(s) return (s or ""):gsub("'", "''") end
 
+-- Tokenizer for hybrid search keyword extraction
+local _STOP = {}
+for _, w in ipairs({
+    "a","an","the","and","or","but","not","no","nor","so","yet",
+    "is","am","are","was","were","be","been","being",
+    "has","have","had","do","does","did","will","would","shall","should",
+    "can","could","may","might","must",
+    "in","on","at","to","for","of","by","from","with","about","between",
+    "through","during","before","after","above","below","up","down",
+    "out","off","over","under","into",
+    "i","me","my","we","us","our","you","your","he","him","his",
+    "she","her","it","its","they","them","their",
+    "this","that","these","those","what","which","who","whom","how",
+    "when","where","why","if","then","than","as","while",
+    "all","each","every","both","few","more","most","some","any","such",
+    "very","just","also","only","too","own","same","other",
+}) do _STOP[w] = true end
+
+local function extract_keywords(text)
+    local seen, result, prev = {}, {}, nil
+    for word in text:lower():gmatch("[%w]+") do
+        if #word >= 2 and not _STOP[word] and not seen[word] then
+            seen[word] = true
+            result[#result+1] = word
+            if prev then
+                local compound = prev .. word
+                if not seen[compound] then
+                    seen[compound] = true
+                    result[#result+1] = compound
+                end
+            end
+            prev = word
+        else
+            prev = nil
+        end
+    end
+    if #result > 12 then
+        local capped = {}
+        for i = 1, 12 do capped[i] = result[i] end
+        return capped
+    end
+    return result
+end
+
 local function rewrite(req, props)
     local url, key = resolve(props)
     assert(props.OLLAMA_URL and props.OLLAMA_URL ~= "", "OLLAMA_URL property is not set. Set it to your Ollama endpoint reachable from inside Exasol (e.g. 'http://172.17.0.1:11434' for Docker bridge). Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.")
@@ -198,10 +242,23 @@ local function rewrite(req, props)
     for _, k in ipairs(keys) do parts[#parts+1] = tostring(emb.embedding[k]) end
     assert(#parts > 0, "Ollama embedding array is empty after iteration")
     local emb_json = "[" .. table.concat(parts, ",") .. "]"
-    local search_body = string.format(
-        '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
-        emb_json, limit
-    )
+    -- Hybrid search: vector + per-keyword RRF fusion
+    local keywords = extract_keywords(qtext)
+    local search_body
+    if #keywords > 0 then
+        local vlimit = math.max(limit * 10, 50)
+        local klimit = math.max(limit * 4, 20)
+        local legs = {string.format('{"query":%s,"using":"text","limit":%d}', emb_json, vlimit)}
+        for _, kw in ipairs(keywords) do
+            legs[#legs+1] = string.format('{"query":%s,"using":"text","limit":%d,"filter":{"must":[{"key":"text","match":{"text":"%s"}}]}}', emb_json, klimit, kw:gsub('"', '\\"'))
+        end
+        search_body = string.format('{"prefetch":[%s],"query":{"fusion":"rrf"},"limit":%d,"with_payload":true}', table.concat(legs, ","), limit)
+    else
+        search_body = string.format(
+            '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
+            emb_json, limit
+        )
+    end
     local h2 = {}
     if key ~= "" then h2["api-key"] = key end
     local sr = http_post_raw(
@@ -346,6 +403,12 @@ def run(ctx):
 
     _qdrant_request("PUT", base_url + "/collections/" + collection,
                     body={"vectors": {"text": {"size": int(vector_size), "distance": distance}}},
+                    api_key=api_key)
+    _qdrant_request("PUT", base_url + "/collections/" + collection + "/index",
+                    body={"field_name": "text", "field_schema": {
+                        "type": "text", "tokenizer": "word",
+                        "min_token_len": 2, "max_token_len": 40,
+                        "lowercase": True}},
                     api_key=api_key)
     return "created: " + collection
 /

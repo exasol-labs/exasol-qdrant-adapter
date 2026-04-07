@@ -88,6 +88,10 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 -- Returns: 'exists: my_articles'  if it already exists
 ```
 
+This UDF also creates a **text payload index** on the collection, which enables
+hybrid search (vector similarity + keyword matching via RRF). See the
+[Hybrid Search](../README.md#hybrid-search) section in the README for details.
+
 Supported distance metrics: `Cosine`, `Dot`, `Euclid`, `Manhattan`.
 
 ### CREATE_QDRANT_COLLECTION parameters

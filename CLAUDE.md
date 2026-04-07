@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Exasol Virtual Schema adapter for semantic similarity search using Qdrant (vector store) and Ollama (local embeddings). Written in Lua, runs inside Exasol's UDF sandbox. Companion Python UDFs handle data ingestion.
 
-**Data flow:** Exasol SQL query -> Lua adapter (inside Exasol) -> Ollama (embed query text) -> Qdrant (cosine similarity search) -> VALUES SQL returned to Exasol.
+**Data flow:** Exasol SQL query -> Lua adapter (inside Exasol) -> Ollama (embed query text) -> Qdrant (hybrid search: vector similarity + keyword RRF fusion) -> VALUES SQL returned to Exasol.
 
 ## Build
 
@@ -49,7 +49,8 @@ Tests use `unittest.mock` (MagicMock, patch). No Lua tests exist currently — o
 - `adapter/QdrantAdapter.lua` — Adapter lifecycle: createVirtualSchema, refresh, setProperties, pushDown, dropVirtualSchema. Extends `AbstractVirtualSchemaAdapter` from `virtual-schema-common-lua`
 - `adapter/AdapterProperties.lua` — Property keys (CONNECTION_NAME, QDRANT_MODEL, OLLAMA_URL, QDRANT_URL, COLLECTION_FILTER), validation, defaults
 - `adapter/MetadataReader.lua` — Maps Qdrant collections to Exasol tables with fixed 4-column schema: ID (VARCHAR), TEXT (VARCHAR), SCORE (DOUBLE), QUERY (VARCHAR). Supports glob-based collection filtering via COLLECTION_FILTER property.
-- `adapter/QueryRewriter.lua` — Embeds query text via Ollama, searches Qdrant, builds VALUES SQL for pushDown response. Gracefully handles empty/missing query text (returns hint row instead of crashing).
+- `adapter/QueryRewriter.lua` — Embeds query text via Ollama, performs hybrid search (vector + keyword RRF fusion) against Qdrant, builds VALUES SQL for pushDown response. Falls back to pure vector search when no meaningful keywords are extracted. Gracefully handles empty/missing query text (returns hint row instead of crashing).
+- `adapter/tokenizer.lua` — Pure-Lua keyword extractor for hybrid search. Splits query text, removes stopwords, deduplicates, and generates compound tokens from adjacent pairs (e.g., "JP" + "Morgan" -> "jpmorgan"). Capped at 12 tokens. Used by QueryRewriter to build per-keyword Qdrant filter legs.
 - `adapter/capabilities.lua` — Declares supported capabilities (SELECTLIST_EXPRESSIONS, FILTER_EXPRESSIONS, LIMIT, EQUAL predicate, STRING literal)
 - `util/http.lua` — LuaSocket + cjson HTTP wrapper (get_json, post_json, post_raw)
 
@@ -86,15 +87,16 @@ No JAR, no BucketFS, no Maven.
 
 ## Test Dataset
 
-**Always use `MUFA.SEMANTIC` as the test/demo dataset** when deploying, testing, or demonstrating the semantic search stack. Do not create ad-hoc sample data — use this table.
+**Always use `MUFA.BANK_FAILURES` as the test/demo dataset** when deploying, testing, or demonstrating the semantic search stack. Do not create ad-hoc sample data — use this table.
 
-- **Table:** `MUFA.SEMANTIC` (544 rows — US bank failures)
-- **Columns:** `"c1"` (ID, DECIMAL), `"Bank"`, `"City"`, `"State"`, `"Date"`, `"Acquired by"`, `"Assets ($mil.)"`
+- **Table:** `MUFA.BANK_FAILURES` (544 rows — US bank failures)
+- **Columns:** `C1` (DECIMAL(3,0)), `BANK` (VARCHAR(84)), `CITY` (VARCHAR(23)), `STATE` (VARCHAR(18)), `DATE` (DATE), `ACQUIRED_BY` (VARCHAR(100)), `ASSETS_MIL` (DECIMAL(7,1))
 - **Qdrant collection name:** `bank_failures`
-- **ID column:** `CAST(ROWNUM AS VARCHAR(36))` (note: `"c1"` is NOT unique — it repeats per year, only 157 distinct values across 544 rows)
+- **ID column:** `CAST(ROWNUM AS VARCHAR(36))` (note: `C1` is NOT unique — it repeats per year, only 157 distinct values across 544 rows)
+- **Reserved keywords:** `STATE` and `DATE` are Exasol reserved keywords — always double-quote them in SQL
 - **Text column:** Concatenate into a descriptive sentence for best embedding quality:
   ```sql
-  "Bank" || ' in ' || "City" || ', ' || "State" || '. Failed on ' || CAST("Date" AS VARCHAR(10)) || '. Acquired by ' || "Acquired by" || '. Assets: $' || CAST("Assets ($mil.)" AS VARCHAR(20)) || ' million.'
+  "BANK" || ' in ' || "CITY" || ', ' || "STATE" || '. Failed on ' || CAST("DATE" AS VARCHAR(10)) || '. Acquired by ' || "ACQUIRED_BY" || '. Assets: $' || CAST("ASSETS_MIL" AS VARCHAR(20)) || ' million.'
   ```
 
 **Ingestion command (after deploying via install_all.sql):**
@@ -103,17 +105,17 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION('172.17.0.1', 6333, '', 'bank_failures',
 
 SELECT ADAPTER.EMBED_AND_PUSH(
     CAST(ROWNUM AS VARCHAR(36)),
-    "Bank" || ' in ' || "City" || ', ' || "State" || '. Failed on ' || CAST("Date" AS VARCHAR(10)) || '. Acquired by ' || "Acquired by" || '. Assets: $' || CAST("Assets ($mil.)" AS VARCHAR(20)) || ' million.',
+    "BANK" || ' in ' || "CITY" || ', ' || "STATE" || '. Failed on ' || CAST("DATE" AS VARCHAR(10)) || '. Acquired by ' || "ACQUIRED_BY" || '. Assets: $' || CAST("ASSETS_MIL" AS VARCHAR(20)) || ' million.',
     '172.17.0.1', 6333, '',
     'bank_failures',
     'ollama',
     'http://172.17.0.1:11434',
     'nomic-embed-text'
 )
-FROM MUFA.SEMANTIC
+FROM MUFA.BANK_FAILURES
 GROUP BY IPROC();
 
-ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+ALTER VIRTUAL SCHEMA VECTOR_SCHEMA REFRESH;
 ```
 
 **Example queries:**

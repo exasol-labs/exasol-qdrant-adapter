@@ -79,11 +79,41 @@ whichever metric the collection was created with.
 
 ---
 
-## Semantic search only — no BM25 / keyword search
+## Hybrid search requires Qdrant text index
 
-The adapter uses vector similarity exclusively. There is no BM25 or keyword
-search capability. For hybrid search (semantic + keyword), query Qdrant directly
-or use a separate full-text search solution alongside the virtual schema.
+The adapter uses hybrid search by default: vector similarity combined with
+keyword matching via Qdrant's Reciprocal Rank Fusion (RRF). This requires:
+
+- **Qdrant 1.7+** (for text payload indexes and the prefetch/fusion query API)
+- A **text payload index** on the `text` field in each Qdrant collection
+
+Collections created with `CREATE_QDRANT_COLLECTION` (v2.2.0+) automatically
+include the text index. For collections created with older versions, add the
+index manually:
+
+```bash
+curl -X PUT 'http://<qdrant_host>:6333/collections/<name>/index' \
+  -H 'Content-Type: application/json' \
+  -d '{"field_name":"text","field_schema":{"type":"text","tokenizer":"word","min_token_len":2,"max_token_len":40,"lowercase":true}}'
+```
+
+**Fallback behavior:** The adapter falls back to pure vector search when:
+
+- No meaningful keywords can be extracted from the query (e.g., all stopwords)
+- The Qdrant collection does not have a text payload index (the prefetch/fusion
+  request will fail, and the adapter does not retry with a simpler query)
+
+**Keyword extraction details:** The tokenizer splits query text on non-alphanumeric
+characters, lowercases all tokens, removes English stopwords (~100 common words),
+and deduplicates. Adjacent non-stopword pairs are also concatenated to generate
+compound tokens (e.g., "JP" + "Morgan" generates both "jp", "morgan", and
+"jpmorgan"). The total token count is capped at 12 to limit the number of
+prefetch legs sent to Qdrant.
+
+**SCORE column with hybrid search:** When hybrid search is active, the `SCORE`
+column contains an RRF fusion score (not a raw cosine similarity). These scores
+are relative rankings, not absolute similarity measures. Higher is still better,
+but the scale differs from pure vector search.
 
 ---
 

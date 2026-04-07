@@ -31,6 +31,7 @@ local modules = {
     "adapter.capabilities",
     "adapter.MetadataReader",
     "adapter.QueryRewriter",
+    "adapter.tokenizer",
     "util.http",
     -- virtual-schema-common-lua (vscl)
     "exasol.vscl.AbstractVirtualSchemaAdapter",

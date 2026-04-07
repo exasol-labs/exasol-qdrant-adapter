@@ -202,7 +202,7 @@ LIMIT 3;
 | auth-001 | How to reset your password: Navigate to the login page...    | ~0.60+  |
 | auth-002 | Setting up two-factor authentication: Two-factor auth adds...| ~0.55+  |
 
-> Even though "locked out" and "cannot get in" don't appear in `auth-003`, the semantic meaning is the same as "account locked after failed login attempts." A keyword search would have returned nothing useful here.
+> Even though "locked out" and "cannot get in" don't appear in `auth-003`, the semantic meaning is the same as "account locked after failed login attempts." With hybrid search (v2.2.0+), the adapter combines this semantic understanding with keyword matching — so queries containing specific names or terms (like "auth-003" or "two-factor") also surface exact matches alongside semantically similar results.
 
 ---
 
