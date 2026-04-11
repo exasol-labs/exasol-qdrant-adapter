@@ -4,3 +4,8 @@ target/
 *.jar
 .gstack/
 future-improvements/
+skills/
+SKILLS/
+openspec/
+ux-pipeline/
+future.md
