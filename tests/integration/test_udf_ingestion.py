@@ -1,20 +1,29 @@
 """
-Integration tests for the UDF ingestion pipeline.
+Integration tests for the UDF ingestion + query pipeline.
 
-Requires a running Qdrant instance (default: localhost:6333).
-Start one with:
+Requires a running Qdrant instance (default: localhost:6333). For the
+EMBED_TEXT smoke + parity tests, a running Exasol with the SLC installed
+and reachable via pyexasol is also required.
+
+Start Qdrant with:
     docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
 
 Run tests with:
     pytest tests/integration/test_udf_ingestion.py -v
 
 Environment variables:
-    QDRANT_HOST      (default: localhost)
-    QDRANT_PORT      (default: 6333)
-    QDRANT_API_KEY   (default: '')
-    OPENAI_API_KEY   (required for OpenAI tests; set to 'skip' to skip them)
+    QDRANT_HOST          (default: localhost)
+    QDRANT_PORT          (default: 6333)
+    QDRANT_API_KEY       (default: '')
+    EXASOL_DSN           (default: unset; required for EMBED_TEXT tests, e.g. 'localhost:8563')
+    EXASOL_USER          (default: sys)
+    EXASOL_PASSWORD      (default: exasol)
+    EXASOL_SCHEMA        (default: ADAPTER)
+    EXASOL_BANK_FAILURES (default: MUFA.BANK_FAILURES; only used for parity test setup)
 """
 
+import json
+import math
 import os
 import sys
 import uuid
@@ -26,49 +35,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'exasol_u
 QDRANT_HOST    = os.environ.get('QDRANT_HOST', 'localhost')
 QDRANT_PORT    = int(os.environ.get('QDRANT_PORT', '6333'))
 QDRANT_API_KEY = os.environ.get('QDRANT_API_KEY', '')
-OPENAI_KEY     = os.environ.get('OPENAI_API_KEY', 'skip')
 
-TEST_COLLECTION = f"udf_integration_test_{uuid.uuid4().hex[:8]}"
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_ctx(rows, **kwargs):
-    """Build a minimal mock ExaContext."""
-    defaults = dict(
-        qdrant_host=QDRANT_HOST,
-        qdrant_port=QDRANT_PORT,
-        qdrant_api_key=QDRANT_API_KEY,
-        collection=TEST_COLLECTION,
-        provider='local',
-        embedding_key='',
-        model_name='all-MiniLM-L6-v2',
-    )
-    defaults.update(kwargs)
-
-    ctx = MagicMock()
-    for k, v in defaults.items():
-        setattr(ctx, k, v)
-
-    row_iter = iter(rows)
-    first = next(row_iter)
-    ctx.id       = first[0]
-    ctx.text_col = first[1]
-
-    remaining = list(row_iter)
-
-    def _next():
-        if not remaining:
-            return False
-        row = remaining.pop(0)
-        ctx.id       = row[0]
-        ctx.text_col = row[1]
-        return True
-
-    ctx.next.side_effect = _next
-    return ctx
+EXASOL_DSN      = os.environ.get('EXASOL_DSN', '')
+EXASOL_USER     = os.environ.get('EXASOL_USER', 'sys')
+EXASOL_PASSWORD = os.environ.get('EXASOL_PASSWORD', 'exasol')
+EXASOL_SCHEMA   = os.environ.get('EXASOL_SCHEMA', 'ADAPTER')
 
 
 def _qdrant_client():
@@ -77,38 +48,19 @@ def _qdrant_client():
                         api_key=QDRANT_API_KEY or None, https=False)
 
 
-# ---------------------------------------------------------------------------
-# Setup / teardown
-# ---------------------------------------------------------------------------
-
-class IntegrationBase(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        """Create the test collection."""
-        import create_collection
-
-        ctx = MagicMock()
-        ctx.host        = QDRANT_HOST
-        ctx.port        = QDRANT_PORT
-        ctx.api_key     = QDRANT_API_KEY
-        ctx.collection  = TEST_COLLECTION
-        ctx.vector_size = 384          # all-MiniLM-L6-v2 dimension
-        ctx.distance    = 'Cosine'
-        ctx.model_name  = ''
-        create_collection.run(ctx)
-
-    @classmethod
-    def tearDownClass(cls):
-        """Delete the test collection."""
-        try:
-            _qdrant_client().delete_collection(TEST_COLLECTION)
-        except Exception:
-            pass
+def _exasol_connection():
+    """Open a pyexasol connection (lazy import — only required for EMBED_TEXT tests)."""
+    import pyexasol
+    return pyexasol.connect(
+        dsn=EXASOL_DSN,
+        user=EXASOL_USER,
+        password=EXASOL_PASSWORD,
+        autocommit=True,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Collection-creation tests (no Exasol session needed; Qdrant only)
 # ---------------------------------------------------------------------------
 
 class TestCreateCollectionIntegration(unittest.TestCase):
@@ -127,13 +79,12 @@ class TestCreateCollectionIntegration(unittest.TestCase):
         ctx.model_name  = ''
 
         try:
-            create_collection.run(ctx)
-            ctx.emit.assert_called_once_with(f'created: {col}')
+            result = create_collection.run(ctx)
+            self.assertEqual(result, f'created: {col}')
 
             # Second call → exists
-            ctx.emit.reset_mock()
-            create_collection.run(ctx)
-            ctx.emit.assert_called_once_with(f'exists: {col}')
+            result = create_collection.run(ctx)
+            self.assertEqual(result, f'exists: {col}')
         finally:
             try:
                 _qdrant_client().delete_collection(col)
@@ -141,96 +92,105 @@ class TestCreateCollectionIntegration(unittest.TestCase):
                 pass
 
 
-class TestEmbedAndPushLocalIntegration(IntegrationBase):
+# ---------------------------------------------------------------------------
+# EMBED_TEXT smoke + parity tests (require Exasol + SLC + BucketFS model)
+# ---------------------------------------------------------------------------
 
-    def test_ingests_rows_with_local_model(self):
-        import embed_and_push
+@unittest.skipIf(not EXASOL_DSN,
+                 'EXASOL_DSN not set — skipping live EMBED_TEXT integration tests')
+class TestEmbedTextLiveIntegration(unittest.TestCase):
+    """Tests that hit a real Exasol with EMBED_TEXT installed."""
 
-        rows = [
-            ('doc-1', 'Machine learning is a subset of artificial intelligence'),
-            ('doc-2', 'The Eiffel Tower is located in Paris'),
-            ('doc-3', 'Python is a popular programming language'),
-        ]
-        ctx = _make_ctx(rows)
-        embed_and_push.run(ctx)
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = _exasol_connection()
 
-        ctx.emit.assert_called_once()
-        _, count = ctx.emit.call_args[0]
-        self.assertEqual(count, 3)
-
-        # Verify points exist in Qdrant
-        client = _qdrant_client()
-        results, _ = client.scroll(
-            collection_name=TEST_COLLECTION,
-            limit=10,
-            with_payload=True,
-        )
-        found_ids = {p.payload.get('id') for p in results}
-        self.assertIn('doc-1', found_ids)
-        self.assertIn('doc-2', found_ids)
-        self.assertIn('doc-3', found_ids)
-
-    def test_upsert_overwrites_existing_point(self):
-        import embed_and_push
-
-        rows = [('doc-1', 'Updated text for doc-1')]
-        ctx = _make_ctx(rows)
-        embed_and_push.run(ctx)
-
-        client = _qdrant_client()
-        results, _ = client.scroll(
-            collection_name=TEST_COLLECTION,
-            scroll_filter=None,
-            limit=100,
-            with_payload=True,
-        )
-        doc1 = next((p for p in results if p.payload.get('id') == 'doc-1'), None)
-        self.assertIsNotNone(doc1)
-        self.assertEqual(doc1.payload['text'], 'Updated text for doc-1')
-
-    def test_ingests_more_than_batch_size(self):
-        import embed_and_push
-
-        rows = [(f'bulk-{i}', f'Document number {i} with some text') for i in range(150)]
-        ctx = _make_ctx(rows)
-        embed_and_push.run(ctx)
-
-        _, count = ctx.emit.call_args[0]
-        self.assertEqual(count, 150)
-
-
-@unittest.skipIf(OPENAI_KEY == 'skip', 'OPENAI_API_KEY not set — skipping OpenAI integration tests')
-class TestEmbedAndPushOpenAIIntegration(IntegrationBase):
-
-    def test_ingests_rows_with_openai(self):
-        import embed_and_push
-
-        # Need a collection with the right OpenAI dimension (1536)
-        openai_col = f"openai_int_{uuid.uuid4().hex[:6]}"
-        import create_collection
-
-        col_ctx = MagicMock()
-        col_ctx.host        = QDRANT_HOST
-        col_ctx.port        = QDRANT_PORT
-        col_ctx.api_key     = QDRANT_API_KEY
-        col_ctx.collection  = openai_col
-        col_ctx.vector_size = None
-        col_ctx.distance    = 'Cosine'
-        col_ctx.model_name  = 'text-embedding-3-small'
-        create_collection.run(col_ctx)
-
+    @classmethod
+    def tearDownClass(cls):
         try:
-            rows = [('oa-1', 'Semantic search enables meaning-based retrieval')]
-            ctx = _make_ctx(rows, collection=openai_col,
-                            provider='openai', embedding_key=OPENAI_KEY,
-                            model_name='text-embedding-3-small')
-            embed_and_push.run(ctx)
+            cls.conn.close()
+        except Exception:
+            pass
 
-            _, count = ctx.emit.call_args[0]
-            self.assertEqual(count, 1)
+    def _embed_text(self, text):
+        result = self.conn.execute(
+            f"SELECT {EXASOL_SCHEMA}.EMBED_TEXT(:t)",
+            {"t": text},
+        ).fetchone()
+        return result[0] if result else None
+
+    def test_embed_text_returns_768_float_json_array(self):
+        raw = self._embed_text('banks in New York')
+        self.assertIsInstance(raw, str)
+        self.assertTrue(raw, "EMBED_TEXT returned empty string")
+        vec = json.loads(raw)
+        self.assertIsInstance(vec, list)
+        self.assertEqual(len(vec), 768)
+        for v in vec:
+            self.assertIsInstance(v, float)
+
+    def test_embed_text_l2_norm_is_one(self):
+        raw = self._embed_text('large bank failures')
+        vec = json.loads(raw)
+        norm = math.sqrt(sum(v * v for v in vec))
+        self.assertAlmostEqual(norm, 1.0, places=4)
+
+    def test_embed_text_null_returns_null(self):
+        result = self.conn.execute(
+            f"SELECT {EXASOL_SCHEMA}.EMBED_TEXT(NULL) IS NULL"
+        ).fetchone()
+        self.assertTrue(result[0])
+
+    def test_embed_text_empty_returns_null(self):
+        result = self.conn.execute(
+            f"SELECT {EXASOL_SCHEMA}.EMBED_TEXT('') IS NULL"
+        ).fetchone()
+        self.assertTrue(result[0])
+
+    def test_embed_text_parity_with_embed_and_push_local(self):
+        """Encode the same text via EMBED_TEXT and via EMBED_AND_PUSH_LOCAL,
+        retrieve the upserted vector from Qdrant, and assert bit-for-bit equality.
+        Both UDFs share the same SLC + BucketFS model, so the vectors must match.
+        """
+        from qdrant_client.http import models as qmodels
+        client = _qdrant_client()
+
+        col = f"parity_check_{uuid.uuid4().hex[:6]}"
+        try:
+            client.recreate_collection(
+                collection_name=col,
+                vectors_config={"text": qmodels.VectorParams(size=768, distance=qmodels.Distance.COSINE)},
+            )
+
+            text = 'banks acquired by JP Morgan'
+            probe_id = 'parity-probe-1'
+
+            # Path A: EMBED_AND_PUSH_LOCAL writes the vector into Qdrant.
+            self.conn.execute(
+                f"""SELECT {EXASOL_SCHEMA}.EMBED_AND_PUSH_LOCAL(
+                        'embedding_conn', :col, :id, :t)
+                    FROM (SELECT 1 FROM DUAL)
+                    GROUP BY IPROC()""",
+                {"col": col, "id": probe_id, "t": text},
+            )
+
+            # Path B: EMBED_TEXT returns the JSON-encoded vector directly.
+            embed_text_raw = self._embed_text(text)
+            embed_text_vec = json.loads(embed_text_raw)
+
+            # Read back the vector from Qdrant.
+            points, _ = client.scroll(
+                collection_name=col, limit=1, with_vectors=True, with_payload=True)
+            self.assertGreater(len(points), 0)
+            qdrant_vec = points[0].vector["text"]
+
+            self.assertEqual(len(embed_text_vec), len(qdrant_vec))
+            for a, b in zip(embed_text_vec, qdrant_vec):
+                # Both come from the same SLC + model; require near-exact equality.
+                self.assertAlmostEqual(a, b, places=5)
         finally:
             try:
-                _qdrant_client().delete_collection(openai_col)
+                client.delete_collection(col)
             except Exception:
                 pass
 

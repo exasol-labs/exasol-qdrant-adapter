@@ -11,8 +11,23 @@
 -- Output:
 --   dist/adapter.lua  — single-file adapter, ready for CREATE LUA ADAPTER SCRIPT
 
-local repo_root = arg and arg[0] and arg[0]:match("(.+)/[^/]+$") .. "/.." or "."
-repo_root = repo_root:gsub("\\", "/")
+-- Anchor on this script's location, then resolve to the absolute repo root
+-- (parent of build/). We need an absolute path because the inner amalg
+-- invocation runs with cwd=src/lua/, and any relative output path would be
+-- resolved relative to *that*, not the repo root.
+local script_dir = arg and arg[0] and arg[0]:match("(.+)/[^/]+$") or "."
+script_dir = script_dir:gsub("\\", "/")
+local repo_root = script_dir .. "/.."
+
+-- Convert to absolute (works on both Windows cmd.exe and POSIX shells).
+local cwd_h = io.popen(package.config:sub(1,1) == "\\" and "cd" or "pwd")
+if cwd_h then
+    local cwd = (cwd_h:read("*l") or "."):gsub("\\", "/")
+    cwd_h:close()
+    if not repo_root:match("^[A-Za-z]:/") and not repo_root:match("^/") then
+        repo_root = cwd .. "/" .. repo_root
+    end
+end
 
 local src_dir  = repo_root .. "/src/lua"
 local dist_dir = repo_root .. "/dist"
@@ -31,7 +46,6 @@ local modules = {
     "adapter.capabilities",
     "adapter.MetadataReader",
     "adapter.QueryRewriter",
-    "adapter.tokenizer",
     "util.http",
     -- virtual-schema-common-lua (vscl)
     "exasol.vscl.AbstractVirtualSchemaAdapter",
@@ -58,14 +72,24 @@ local modules = {
 os.execute(string.format('mkdir -p "%s" 2>%s', dist_dir,
     package.config:sub(1,1) == "\\" and "NUL" or "/dev/null"))
 
--- Detect LuaRocks share path automatically via `luarocks path`
+-- Detect LuaRocks share path automatically via `luarocks path --lr-path`.
+-- That call returns one or more path entries like
+--   .../rocks/share/lua/5.4/?.lua;.../rocks/share/lua/5.4/?/init.lua
+-- We strip the `?.lua` / `?/init.lua` suffix to get the share directory,
+-- since amalg.lua lives directly inside it.
 local rocks_share
-local lr = io.popen("luarocks path --lr-path 2>/dev/null")
+local null_redirect = package.config:sub(1,1) == "\\" and "2>NUL" or "2>/dev/null"
+local lr = io.popen("luarocks path --lr-path " .. null_redirect)
 if lr then
-    local lr_path = lr:read("*a"):match("^([^\n;]+)")
+    local raw = lr:read("*a") or ""
     lr:close()
-    if lr_path then
-        rocks_share = lr_path:match("^(.+)/[^/]+$")
+    for entry in raw:gmatch("[^;\n]+") do
+        local cand = entry:gsub("\\", "/")
+        cand = cand:gsub("/%?/init%.lua$", ""):gsub("/%?%.lua$", "")
+        if cand ~= "" and cand:match("rocks/share/lua/[%d%.]+$") then
+            rocks_share = cand
+            break
+        end
     end
 end
 rocks_share = rocks_share
@@ -79,8 +103,12 @@ local lua_path = string.format("%s/?.lua;%s/?.lua;%s/?/init.lua;;",
 -- Set it directly so the child process inherits it via package.path.
 package.path = lua_path
 
+-- amalg ships as a Lua script inside the rocks share dir. We pass its full
+-- path so the inner `lua` invocation can find it without depending on the
+-- current working directory.
+local amalg_script = rocks_share .. "/amalg.lua"
 local args = {
-    "amalg.lua",
+    string.format('"%s"', amalg_script),
     "-o", string.format('"%s"', output),
     "-s", entry,
 }

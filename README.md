@@ -4,7 +4,7 @@
 
 # Exasol Qdrant Vector Search Adapter
 
-A Virtual Schema adapter that brings semantic similarity search into Exasol SQL using [Qdrant](https://qdrant.tech/) as the vector store and [Ollama](https://ollama.com/) for local text embeddings.
+A Virtual Schema adapter that brings semantic similarity search into Exasol SQL using [Qdrant](https://qdrant.tech/) as the vector store and an in-database `sentence-transformers` UDF for text embeddings — no external embedding service required.
 
 ```sql
 -- Find the most semantically similar documents — pure SQL
@@ -19,30 +19,34 @@ LIMIT 5;
 ```
 Exasol SQL query
       ↓
-Virtual Schema Adapter (Lua, runs inside Exasol — no BucketFS, no JAR)
+Virtual Schema Adapter (Lua, runs inside Exasol — no JAR)
       ↓
-Ollama (local embeddings — text → float vector)
+ADAPTER.SEARCH_QDRANT_LOCAL SET UDF (in-database, sentence-transformers + nomic-embed-text-v1.5)
       ↓
 Qdrant (hybrid search: vector similarity + keyword matching via RRF)
       ↓
 Ranked results back to Exasol
 ```
 
-- **Hybrid search** — combines vector similarity with keyword matching using Qdrant's Reciprocal Rank Fusion (RRF), so entity-specific queries like "acquired by JP Morgan" surface exact matches alongside semantically similar results
-- No pre-computed embeddings needed — the adapter calls Ollama automatically at query time
-- Results are ranked by fused similarity score (higher = more relevant)
-- Works with any Ollama embedding model (default: `nomic-embed-text`)
-- Deployed as a single SQL statement — no Maven build, no BucketFS upload
+- **In-database embeddings** — both the query path and the ingest path call `sentence-transformers` inside Exasol's UDF VM. No Ollama, no out-of-database embedding service.
+- **Hybrid search** — combines vector similarity with keyword matching using Qdrant's Reciprocal Rank Fusion (RRF), so entity-specific queries like "acquired by JP Morgan" surface exact matches alongside semantically similar results.
+- No pre-computed embeddings needed — `ADAPTER.SEARCH_QDRANT_LOCAL` embeds and searches at query time inside the UDF VM (~50–150 ms after the first call).
+- Results are ranked by fused similarity score (higher = more relevant).
+- Single bundled SLC + model in BucketFS — one upload, used by every query and every ingest.
+
+> **Migrating from earlier versions?** If you previously deployed this adapter with `OLLAMA_URL` or `EMBED_AND_PUSH` / `EMBED_AND_PUSH_V2`, see the migration steps in [`docs/local-embeddings.md`](docs/local-embeddings.md#migration-from-ollama). Short version: drop the virtual schema, re-run `scripts/install_all.sql`, re-ingest into a fresh collection via `EMBED_AND_PUSH_LOCAL`, and `docker rm -f ollama`.
 
 ---
 
 ## Prerequisites
 
-| Component | Version | Notes                               |
-| --------- | ------- | ----------------------------------- |
-| Exasol    | 7.x+    | Docker or on-premise                |
+| Component | Version | Notes                                |
+| --------- | ------- | ------------------------------------ |
+| Exasol    | 7.x+    | Docker or on-premise                 |
 | Qdrant    | 1.7+    | Docker recommended (1.7+ required for hybrid search) |
-| Ollama    | latest  | Must have `nomic-embed-text` pulled |
+| SLC + model | once  | Build and upload via `./scripts/build_and_upload_slc.sh` (one-time) |
+
+The SLC ships `sentence-transformers` and `nomic-embed-text-v1.5` (768-dim cosine). Both `EMBED_TEXT` (query) and `EMBED_AND_PUSH_LOCAL` (ingest) load it at module-import time inside the UDF VM.
 
 **Dev-only** (only needed to rebuild `dist/adapter.lua` after source changes):
 
@@ -71,16 +75,17 @@ Default credentials: `host=localhost, port=8563, user=sys, password=exasol`.
 docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
 ```
 
-### 3. Start Ollama and pull the embedding model
+### 3. Build and upload the SLC + model (one time)
 
 ```bash
-docker run -d --name ollama -p 11434:11434 ollama/ollama
-docker exec ollama ollama pull nomic-embed-text
+./scripts/build_and_upload_slc.sh
 ```
+
+Builds the `qdrant-embed` SLC and uploads it plus the `nomic-embed-text-v1.5` model tarball to Exasol's BucketFS. See [`docs/local-embeddings.md`](docs/local-embeddings.md) for build prerequisites and tuning.
 
 ### 4. Install everything in Exasol (one file)
 
-Open [`scripts/install_all.sql`](scripts/install_all.sql) in your SQL client (DBeaver, DbVisualizer, etc.). Update the IPs in the `CONFIGURATION` section if needed, then run the entire file.
+Open [`scripts/install_all.sql`](scripts/install_all.sql) in your SQL client (DBeaver, DbVisualizer, etc.). Update the IPs in the `STEP 2` and `STEP 9` sections if needed, then run the entire file.
 
 > **SQL client setup:** This file uses `/` (forward slash on its own line) as the
 > statement separator — not `;`. Configure your SQL client accordingly:
@@ -94,26 +99,25 @@ Open [`scripts/install_all.sql`](scripts/install_all.sql) in your SQL client (DB
 
 It deploys:
 
-- Schema, connection, Lua adapter script
-- Python UDFs for data ingestion (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH_V2`, `EMBED_AND_PUSH`)
+- Schema, two CONNECTION objects (`qdrant_conn`, `embedding_conn`), Lua adapter script
+- Python UDFs: `CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH_LOCAL`, `EMBED_TEXT`, `SEARCH_QDRANT_LOCAL`, `PREFLIGHT_CHECK`
 - Virtual schema ready for queries
 
 ```bash
 # Default config values (change if your setup differs):
 #   Qdrant:  http://172.17.0.1:6333
-#   Ollama:  http://172.17.0.1:11434
-#   Model:   nomic-embed-text
+#   Model:   nomic-embed-text-v1.5  (loaded from BucketFS, no Ollama)
 #   Schema:  ADAPTER
 ```
 
-> **No BucketFS, no JAR, no Maven, no pasting.** One file, one run, everything deployed.
+> **No JAR, no Maven, no separate embedding service.** The SLC + model live in BucketFS once; everything else is a single SQL file.
 
-> **Docker networking note:** `host.docker.internal` does not resolve inside Exasol's UDF sandbox on Linux. Use the Docker bridge gateway IP (typically `172.17.0.1`) for **both** the Lua adapter (OLLAMA_URL property) and the Python UDFs (connection config). This is the same IP for Qdrant and Ollama -- use the gateway IP everywhere, not the container IP. Find it with:
+> **Docker networking note:** `host.docker.internal` does not resolve inside Exasol's UDF sandbox on Linux. Use the Docker bridge gateway IP (typically `172.17.0.1`) for the Qdrant URL. Find it with:
 >
 > ```bash
 > docker exec exasoldb ip route show default
 > # --> default via 172.17.0.1 dev eth0
-> # Use 172.17.0.1 for BOTH qdrant_url and ollama_url
+> # Use 172.17.0.1 for qdrant_url
 > ```
 
 ---
@@ -121,10 +125,10 @@ It deploys:
 ## Step 5: Verify the Installation
 
 > **Always run this example first** before loading your own data. If this works,
-> your entire stack (Exasol, Qdrant, Ollama, adapter, UDFs, virtual schema)
-> is correctly deployed.
+> your entire stack (Exasol, Qdrant, adapter, UDFs, virtual schema) is correctly
+> deployed.
 
-After running `install_all.sql`, try this complete example to see semantic search working in under a minute. It creates a small sample table, ingests it into Qdrant, and queries it.
+After running `install_all.sql`, try this complete example to see semantic search working in under a minute. It creates a small sample table, ingests it into Qdrant via the in-database SLC UDF, and queries it.
 
 ```sql
 -- 1. Create a sample table with 5 documents
@@ -143,8 +147,8 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
     '172.17.0.1', 6333, '', 'hello_world', 768, 'Cosine', ''
 );
 
--- 3. Embed and push the documents (using V2 with CONNECTION)
-SELECT ADAPTER.EMBED_AND_PUSH_V2(
+-- 3. Embed and push the documents (in-process via SLC, CONNECTION-driven)
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
     'embedding_conn',
     'hello_world',
     CAST(ID AS VARCHAR(36)),
@@ -157,7 +161,6 @@ GROUP BY IPROC();
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 
 -- 5. Search! Find documents about AI / machine learning
--- (Each query takes ~5-8 seconds — this is normal, see Performance Note below)
 SELECT "ID", "TEXT", "SCORE"
 FROM vector_schema.hello_world
 WHERE "QUERY" = 'artificial intelligence'
@@ -172,9 +175,9 @@ LIMIT 5;
 -- Expected: "The quick brown fox..." ranks highest
 ```
 
-> **Timing:** Embedding 5 documents takes about 5–10 seconds. For larger datasets
-> (e.g., 544 rows), expect 30–60 seconds. The query will appear to "hang" until
-> all embeddings are computed and uploaded — this is normal.
+> **Timing:** First call after a UDF VM restart pays a 3–8 s model load from BucketFS.
+> Subsequent calls in the same VM run at ~50–150 ms per encode. Ingest of 544 rows
+> via `EMBED_AND_PUSH_LOCAL` typically completes in 60–90 s on a single-VM dev box.
 
 > **Tip:** To ingest your own Exasol table, replace the placeholders below:
 >
@@ -184,8 +187,8 @@ LIMIT 5;
 >     '172.17.0.1', 6333, '', 'my_collection', 768, 'Cosine', ''
 > );
 >
-> -- 2. Embed and push rows from your table
-> SELECT ADAPTER.EMBED_AND_PUSH_V2(
+> -- 2. Embed and push rows from your table (in-process)
+> SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
 >     'embedding_conn',
 >     'my_collection',
 >     CAST(id_column AS VARCHAR(36)),
@@ -208,37 +211,32 @@ LIMIT 5;
 
 There are two ways to get data into Qdrant so you can query it via the virtual schema:
 
-### Option A — Ingestion via Exasol UDFs (recommended for Exasol-native data)
+### Option A — Ingestion via `EMBED_AND_PUSH_LOCAL` (recommended)
 
-If your source data already lives in Exasol tables, use a UDF to embed rows with Ollama and push them to Qdrant without leaving SQL. **No SLC or extra packages required** — the UDFs use Python's standard library only.
-
-#### `EMBED_AND_PUSH_V2` (recommended — CONNECTION-based)
-
-Simplified 4-parameter UDF that reads infrastructure config from a CONNECTION object. Credentials never appear in SQL text or audit logs.
+If your source data already lives in Exasol tables, use the `EMBED_AND_PUSH_LOCAL` SET UDF to embed rows in-process via the BucketFS-resident SLC + model and push them to Qdrant — all without leaving SQL.
 
 ```sql
--- 1. Create a CONNECTION with config as JSON in the address field
-CREATE OR REPLACE CONNECTION embedding_conn TO '{
-    "qdrant_url": "http://172.17.0.1:6333",
-    "ollama_url": "http://172.17.0.1:11434",
-    "provider": "ollama",
-    "model": "nomic-embed-text"
-}';
+-- 1. The CONNECTION created by install_all.sql holds the Qdrant URL.
+--    The address field is a JSON config blob. Reuse or recreate as needed:
+CREATE OR REPLACE CONNECTION embedding_conn
+    TO '{"qdrant_url":"http://172.17.0.1:6333","qdrant_api_key":""}'
+    USER ''
+    IDENTIFIED BY '';
 
--- 2. Create the Qdrant collection
+-- 2. Create the Qdrant collection (768 dimensions for nomic-embed-text-v1.5)
 SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
     '172.17.0.1', 6333, '', 'my_collection', 768, 'Cosine', ''
 );
 
--- 3. Embed and push — just 4 parameters
-SELECT ADAPTER.EMBED_AND_PUSH_V2(
+-- 3. Embed and push — 4 parameters, same shape for every ingest
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
     'embedding_conn',                   -- connection name
     'my_collection',                    -- Qdrant collection
     CAST(id_col AS VARCHAR(255)),       -- unique ID
     text_col                            -- text to embed
 )
 FROM MY_SCHEMA.MY_TABLE
-GROUP BY IPROC();  -- REQUIRED for SET UDFs
+GROUP BY IPROC();  -- REQUIRED for SET UDFs — fans work across cluster nodes
 
 -- 4. Search
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
@@ -248,104 +246,49 @@ WHERE "QUERY" = 'your search query here'
 LIMIT 10;
 ```
 
-#### `EMBED_AND_PUSH` (legacy — 9 positional parameters)
-
-> **Security Warning:** This UDF passes API keys as plain-text SQL parameters. These values appear **verbatim** in Exasol's audit log (`EXA_DBA_AUDIT_SQL`). Anyone with SELECT access to audit tables can harvest your credentials. **Always prefer `EMBED_AND_PUSH_V2` above**, which stores credentials in a CONNECTION object (redacted as `<SECRET>` in audit logs).
-
-The original UDF is still available for backward compatibility:
-
-```sql
-SELECT ADAPTER.EMBED_AND_PUSH(
-    CAST(id_col AS VARCHAR(36)),
-    text_col,                       -- or a concatenation of columns
-    '172.17.0.1', 6333, '',        -- Qdrant host, port, API key
-    'my_collection',                -- Qdrant collection name
-    'ollama',                       -- embedding provider
-    'http://172.17.0.4:11434',      -- Ollama container IP (not localhost)
-    'nomic-embed-text'              -- Ollama model name
-)
-FROM MY_SCHEMA.MY_TABLE
-GROUP BY IPROC();
-```
-
-> **Docker networking:** the UDFs run inside the Exasol container. Use the Ollama
-> container IP (find it with `docker inspect ollama`) — not `localhost` or `172.17.0.1`.
-
-See [docs/udf-ingestion.md](docs/udf-ingestion.md) for the full guide including
-parameter reference, troubleshooting, and OpenAI provider usage.
+See [`docs/local-embeddings.md`](docs/local-embeddings.md) for SLC build details, sizing rules, and multi-node scaling notes. The full ingest UDF reference (parameters, error handling, examples) is in [`docs/udf-ingestion.md`](docs/udf-ingestion.md).
 
 ### Option B — Direct HTTP ingestion (no Exasol UDFs)
 
-Since Exasol virtual schemas are read-only, data can also be inserted directly into Qdrant via its REST API. The adapter handles query-time embedding automatically via Ollama.
+Since Exasol virtual schemas are read-only, data can also be inserted directly into Qdrant via its REST API. The adapter handles query-time embedding automatically via the in-database `SEARCH_QDRANT_LOCAL` UDF — you just need to put 768-dim normalized vectors into Qdrant.
 
-**curl (Linux/macOS/WSL):**
+You'll need to compute embeddings yourself (matching `nomic-embed-text-v1.5`, normalized) using a Python script, the `sentence-transformers` library, or any compatible inference service — and then PUT them to Qdrant's `/points` endpoint.
 
-```bash
-# Create collection (768 dimensions for nomic-embed-text)
-curl -X PUT 'http://localhost:6333/collections/articles' \
-  -H 'Content-Type: application/json' \
-  -d '{"vectors":{"text":{"size":768,"distance":"Cosine"}}}'
+**Minimal Python example:**
 
-# Create text payload index (required for hybrid search)
-curl -X PUT 'http://localhost:6333/collections/articles/index' \
-  -H 'Content-Type: application/json' \
-  -d '{"field_name":"text","field_schema":{"type":"text","tokenizer":"word","min_token_len":2,"max_token_len":40,"lowercase":true}}'
+```python
+from sentence_transformers import SentenceTransformer
+import json, urllib.request, uuid
 
-# Get embedding from Ollama
-EMBEDDING=$(curl -s http://localhost:11434/api/embeddings \
-  -d '{"model":"nomic-embed-text","prompt":"Machine learning is a subset of AI"}' \
-  | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['embedding']))")
+model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+text = "Machine learning is a subset of AI"
+vec = model.encode(text, normalize_embeddings=True).tolist()
 
-# Upsert into Qdrant
-curl -X PUT "http://localhost:6333/collections/articles/points" \
-  -H 'Content-Type: application/json' \
-  -d "{\"points\":[{\"id\":\"$(uuidgen)\",\"payload\":{\"_original_id\":\"doc-1\",\"text\":\"Machine learning is a subset of AI\"},\"vectors\":{\"text\":$EMBEDDING}}]}"
+# Create the collection (one-time)
+urllib.request.Request("http://localhost:6333/collections/articles",
+    method="PUT", data=json.dumps({"vectors":{"text":{"size":768,"distance":"Cosine"}}}).encode(),
+    headers={"Content-Type":"application/json"})
 
-# Refresh virtual schema to see the new collection
-# Run in Exasol: ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+# Upsert one point
+body = json.dumps({"points":[{
+    "id": str(uuid.uuid4()),
+    "vector": {"text": vec},
+    "payload": {"_original_id": "doc-1", "text": text}
+}]}).encode()
+urllib.request.urlopen(urllib.request.Request(
+    "http://localhost:6333/collections/articles/points",
+    method="PUT", data=body, headers={"Content-Type":"application/json"}))
 ```
 
-**PowerShell (Windows):**
+After upsert, run `ALTER VIRTUAL SCHEMA vector_schema REFRESH` in Exasol and the new collection appears as a virtual table.
 
-```powershell
-function Add-Document($collection, $id, $text) {
-    # Get embedding from Ollama
-    $body = @{ model = "nomic-embed-text"; prompt = $text } | ConvertTo-Json
-    $resp = Invoke-RestMethod -Method POST -Uri 'http://localhost:11434/api/embeddings' `
-        -ContentType 'application/json' -Body $body
+---
 
-    # Upsert into Qdrant
-    $point = @{
-        points = @(@{
-            id      = [guid]::NewGuid().ToString()
-            payload = @{ _original_id = $id; text = $text }
-            vectors = @{ text = $resp.embedding }
-        })
-    } | ConvertTo-Json -Depth 10
+## Local Embeddings via SLC + BucketFS
 
-    Invoke-RestMethod -Method PUT `
-        -Uri "http://localhost:6333/collections/$collection/points" `
-        -ContentType 'application/json' -Body $point
-}
+`EMBED_AND_PUSH_LOCAL` and `EMBED_TEXT` both run `sentence-transformers` directly inside the UDF VM, sharing one BucketFS-resident `nomic-embed-text-v1.5` model copy per node. Per-node parallelism via `GROUP BY IPROC()` scales linearly across an Exasol cluster.
 
-# Create collection (768 dimensions for nomic-embed-text)
-Invoke-RestMethod -Method PUT -Uri 'http://localhost:6333/collections/articles' `
-  -ContentType 'application/json' `
-  -Body '{"vectors":{"text":{"size":768,"distance":"Cosine"}}}'
-
-# Create text payload index (required for hybrid search)
-Invoke-RestMethod -Method PUT -Uri 'http://localhost:6333/collections/articles/index' `
-  -ContentType 'application/json' `
-  -Body '{"field_name":"text","field_schema":{"type":"text","tokenizer":"word","min_token_len":2,"max_token_len":40,"lowercase":true}}'
-
-# Insert documents
-Add-Document "articles" "doc-1" "Machine learning is a subset of artificial intelligence"
-Add-Document "articles" "doc-2" "The Eiffel Tower is located in Paris, France"
-Add-Document "articles" "doc-3" "Neural networks are inspired by the human brain"
-
-# Refresh virtual schema to see the new collection as a table
-# Run in Exasol: ALTER VIRTUAL SCHEMA vector_schema REFRESH;
-```
+Setup is a one-time SLC build + BucketFS upload (Linux Docker host required). Full guide in [`docs/local-embeddings.md`](docs/local-embeddings.md).
 
 ---
 
@@ -357,14 +300,10 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 
 ## Pre-Flight Health Check
 
-Before creating the virtual schema or ingesting data, verify that Qdrant and Ollama are reachable from inside Exasol:
+Before creating the virtual schema or ingesting data, verify that Qdrant is reachable and the in-database embedding model is loadable from BucketFS:
 
 ```sql
-SELECT ADAPTER.PREFLIGHT_CHECK(
-    'http://172.17.0.1:6333',    -- Qdrant URL
-    'http://172.17.0.1:11434',   -- Ollama URL
-    'nomic-embed-text'           -- Model name
-);
+SELECT ADAPTER.PREFLIGHT_CHECK('http://172.17.0.1:6333');
 ```
 
 Returns a structured report:
@@ -372,12 +311,10 @@ Returns a structured report:
 ```
 === PREFLIGHT CHECK: ALL CHECKS PASSED ===
 [PASS] Qdrant: reachable, 2 collection(s): articles, products
-[PASS] Ollama: reachable, models: nomic-embed-text:latest
-[PASS] Model 'nomic-embed-text': available
-[PASS] Embedding test: 768-dimensional vector returned
+[PASS] Embedding round-trip: 768-dim vector from nomic-embed-text-v1.5
 ```
 
-If any check fails, the report includes troubleshooting steps (Docker bridge IP, model pull commands).
+If any check fails, the report includes troubleshooting steps (Docker bridge IP, SLC install command).
 
 ---
 
@@ -461,7 +398,7 @@ The adapter automatically combines vector similarity with keyword matching using
 - **Qdrant 1.7+** (for text payload indexes and the prefetch/fusion query API)
 - A **text payload index** on the `text` field in each Qdrant collection
 
-Collections created via `CREATE_QDRANT_COLLECTION` (v2.2.0+) include the text index automatically. If you created collections via direct HTTP (Option B above), the curl/PowerShell examples include the index creation step.
+Collections created via `CREATE_QDRANT_COLLECTION` (v2.2.0+) include the text index automatically. If you created collections via direct HTTP (Option B above), include the index creation step in your script.
 
 **Upgrading older collections:** If you have collections created before v2.2.0, add the text index manually (the adapter still works without it, but falls back to pure vector search):
 
@@ -475,26 +412,9 @@ curl -X PUT 'http://localhost:6333/collections/<name>/index' \
 
 ### Performance Note
 
-Each query takes approximately **5-8 seconds**. This latency is dominated by Exasol's Lua sandbox initialization (~80% of total time), not by the embedding or vector search (~150ms combined). This is a known characteristic of Exasol's UDF sandbox architecture.
+After the first call in a UDF VM, each query takes approximately **5-8 seconds**. This latency is dominated by Exasol's Lua sandbox initialization (~80% of total time), not by the embedding (~50–150 ms warm) or vector search (~50–100 ms). The very first query after a VM restart additionally pays a 3–8 s model-load cost for `nomic-embed-text-v1.5` from BucketFS.
 
-For use cases requiring sub-second latency, consider querying Ollama and Qdrant directly via their HTTP APIs (see [Option B: Direct HTTP Ingestion](#option-b-direct-http-ingestion--no-exasol-udfs)).
-
-### Ingestion Tuning
-
-`EMBED_AND_PUSH_V2` reads optional tuning parameters from the CONNECTION config JSON:
-
-| Key          | Default | Description                                                                          |
-| ------------ | ------- | ------------------------------------------------------------------------------------ |
-| `batch_size` | `100`   | Number of texts to embed per API call. Lower for large texts, higher for throughput. |
-| `max_chars`  | `6000`  | Max characters per text before truncation (~1500 tokens for nomic-embed-text).       |
-
-Example CONNECTION with tuning:
-
-```sql
-CREATE OR REPLACE CONNECTION embedding_conn
-    TO '{"qdrant_url":"http://172.17.0.1:6333","ollama_url":"http://172.17.0.1:11434","provider":"ollama","model":"nomic-embed-text","batch_size":50,"max_chars":4000}'
-    USER '' IDENTIFIED BY '';
-```
+For use cases requiring sub-second latency, consider querying Qdrant directly via its HTTP API and computing embeddings client-side with `sentence-transformers` (matching the SLC's `nomic-embed-text-v1.5`, normalized).
 
 ---
 
@@ -503,15 +423,16 @@ CREATE OR REPLACE CONNECTION embedding_conn
 | Property            | Required | Default             | Description                                                                       |
 | ------------------- | -------- | ------------------- | --------------------------------------------------------------------------------- |
 | `CONNECTION_NAME`   | Yes      | —                   | Exasol CONNECTION object with Qdrant URL                                          |
-| `QDRANT_MODEL`      | Yes      | —                   | Ollama model name for embeddings                                                  |
-| `OLLAMA_URL`        | Yes      | —                   | Ollama base URL reachable from Exasol (e.g. `http://172.17.0.1:11434` for Docker) |
+| `QDRANT_MODEL`      | Yes      | —                   | Embedding model name (informational; surfaced in diagnostic errors)               |
 | `QDRANT_URL`        | No       | —                   | Override Qdrant URL (ignores CONNECTION address)                                  |
 | `COLLECTION_FILTER` | No       | — (all collections) | Comma-separated list of collection names or glob patterns to expose               |
+
+> **Removed property:** `OLLAMA_URL` is no longer accepted. The adapter rejects any `CREATE VIRTUAL SCHEMA … WITH OLLAMA_URL = '…'` or `ALTER VIRTUAL SCHEMA … SET OLLAMA_URL = '…'` with a clear migration error. Drop and re-create the virtual schema after running `install_all.sql`.
 
 Change properties without dropping the schema:
 
 ```sql
-ALTER VIRTUAL SCHEMA vector_schema SET OLLAMA_URL = 'http://172.17.0.4:11434';
+ALTER VIRTUAL SCHEMA vector_schema SET COLLECTION_FILTER = 'bank_*';
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 ```
 
@@ -524,8 +445,7 @@ By default, the virtual schema exposes ALL Qdrant collections as tables. Use `CO
 CREATE VIRTUAL SCHEMA vector_schema
     USING ADAPTER.VECTOR_SCHEMA_ADAPTER
     WITH CONNECTION_NAME   = 'qdrant_conn'
-         QDRANT_MODEL      = 'nomic-embed-text'
-         OLLAMA_URL        = 'http://172.17.0.1:11434'
+         QDRANT_MODEL      = 'nomic-embed-text-v1.5'
          COLLECTION_FILTER = 'bank_*,products';
 
 -- Update the filter later
@@ -547,10 +467,9 @@ src/lua/
 │   ├── AdapterProperties.lua    # Property constants, validation, merge semantics
 │   ├── capabilities.lua         # Capability set declaration
 │   ├── MetadataReader.lua       # HTTP GET /collections → table metadata
-│   ├── QueryRewriter.lua        # Hybrid search: Ollama embed + Qdrant RRF + VALUES SQL
-│   └── tokenizer.lua            # Keyword extraction for hybrid search filters
+│   └── QueryRewriter.lua        # Builds pushdown SQL that calls SEARCH_QDRANT_LOCAL
 └── util/
-    └── http.lua                 # LuaSocket JSON GET/POST wrapper
+    └── http.lua                 # LuaSocket JSON GET/POST wrapper (Qdrant only)
 dist/
 └── adapter.lua                  # Single-file bundle (output of lua-amalg)
 build/
@@ -558,12 +477,13 @@ build/
 scripts/
 ├── install_all.sql              # One-file installer (deploy entire stack)
 ├── install_adapter.sql          # Standalone Lua adapter script only
-├── create_udfs_ollama.sql       # Python UDFs only
-└── test_connectivity.sql        # Pre-flight connectivity checks
-exasol_udfs/                     # Python UDF source (EMBED_AND_PUSH, EMBED_AND_PUSH_V2, CREATE_QDRANT_COLLECTION, PREFLIGHT_CHECK)
+├── install_local_embeddings.sql # PYTHON3_QDRANT alias + EMBED_AND_PUSH_LOCAL + EMBED_TEXT + SEARCH_QDRANT_LOCAL
+└── build_and_upload_slc.sh      # One-time SLC build + BucketFS upload
+exasol_udfs/                     # Python UDF source: embed_and_push_local, embed_text, search_qdrant_local, create_collection
 docs/
-├── lua-port/
-│   └── limitations.md           # Known Lua adapter limitations (TLS caveat etc.)
+├── local-embeddings.md          # SLC build, BucketFS upload, throughput notes
+├── quickstart.md                # Step-by-step Docker quickstart
+├── udf-ingestion.md             # EMBED_AND_PUSH_LOCAL reference
 └── ...
 ```
 
@@ -589,7 +509,7 @@ lua build/amalg.lua
 
 - **Hybrid search requires Qdrant text index** -- collections created with `CREATE_QDRANT_COLLECTION` (v2.2.0+) include the text index automatically. For older collections, add the index manually (see [docs/limitations.md](docs/limitations.md)).
 - **Fixed 4-column schema** -- each virtual table exposes ID, TEXT, SCORE, QUERY. Custom Qdrant payload fields are not directly accessible (use JOINs as a workaround, see above).
-- **5-8 second query latency** -- dominated by Exasol's Lua sandbox initialization, not the search itself.
+- **5-8 second query latency** -- dominated by Exasol's Lua sandbox initialization, not the search itself. Cold-VM first queries pay an additional 3–8 s for model load.
 - **Single vector field** -- the adapter searches the `text` vector field. Multi-vector collections are not supported.
 
 ---
@@ -612,17 +532,21 @@ Exasol has a known session-level metadata caching bug where `DROP VIRTUAL SCHEMA
 
 > **Note:** Never use `CASCADE` on the `ADAPTER` schema itself — that would destroy the adapter scripts, UDFs, and connections. `CASCADE` is only safe on the `vector_schema` (virtual schema).
 
+### "function or script ADAPTER.SEARCH_QDRANT_LOCAL not found"
+
+The query path is owned by `SEARCH_QDRANT_LOCAL` (not `EMBED_TEXT` — that one is now a parity utility). Re-run `scripts/install_all.sql` (or the smaller `scripts/install_local_embeddings.sql`), verify `PYTHON3_QDRANT` is registered in `SCRIPT_LANGUAGES`, and confirm `/buckets/bfsdefault/default/models/nomic-embed-text-v1.5` exists in BucketFS (run `./scripts/build_and_upload_slc.sh` if not).
+
 ---
 
 ## Limitations
 
 See [docs/lua-port/limitations.md](docs/lua-port/limitations.md) for full details. Key points:
 
-- **Read-only virtual schema** — INSERT via the virtual schema is not supported; use the `EMBED_AND_PUSH` UDF (see [docs/udf-ingestion.md](docs/udf-ingestion.md)) or the direct HTTP approach below
-- **HTTP or public CA TLS only** — the Lua adapter cannot load custom CA certificates; self-signed TLS on Qdrant/Ollama is not supported
-- **One embedding call per query** — Ollama is called synchronously at query time
+- **Read-only virtual schema** — INSERT via the virtual schema is not supported; use `EMBED_AND_PUSH_LOCAL` (see [docs/udf-ingestion.md](docs/udf-ingestion.md)) or the direct HTTP approach above
+- **HTTP or public CA TLS only** — the Lua adapter cannot load custom CA certificates; self-signed TLS on Qdrant is not supported
+- **One embedding call per query** — `SEARCH_QDRANT_LOCAL` embeds the query text synchronously at query time
 - **No UPDATE or DELETE** — re-insert with the same ID to overwrite (upsert behaviour)
-- **Model consistency** — changing `QDRANT_MODEL` does not re-embed existing data; recreate the collection
+- **Single embedding model per cluster** — the SLC ships exactly one model (`nomic-embed-text-v1.5`); changing models requires rebuilding and re-uploading the SLC
 
 ---
 

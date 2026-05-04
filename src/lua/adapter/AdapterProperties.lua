@@ -10,13 +10,18 @@ setmetatable(AdapterProperties, {__index = base_props})
 
 -- Property key constants
 AdapterProperties.CONNECTION_NAME    = "CONNECTION_NAME"
-AdapterProperties.QDRANT_MODEL      = "QDRANT_MODEL"
-AdapterProperties.OLLAMA_URL        = "OLLAMA_URL"
-AdapterProperties.QDRANT_URL        = "QDRANT_URL"
-AdapterProperties.COLLECTION_FILTER = "COLLECTION_FILTER"
+AdapterProperties.QDRANT_MODEL       = "QDRANT_MODEL"
+AdapterProperties.QDRANT_URL         = "QDRANT_URL"
+AdapterProperties.COLLECTION_FILTER  = "COLLECTION_FILTER"
 
--- No default for OLLAMA_URL — localhost never works inside Docker.
--- Users must set it explicitly (typically to the Docker bridge gateway IP).
+-- Properties that have been removed and SHALL be rejected if encountered.
+-- Maps key → migration message.
+local REMOVED_PROPERTIES = {
+    OLLAMA_URL = "OLLAMA_URL is no longer supported — the query path now embeds "
+        .. "in-database via ADAPTER.SEARCH_QDRANT_LOCAL (no Ollama process is required). "
+        .. "Drop and re-create the virtual schema without OLLAMA_URL after running "
+        .. "scripts/install_all.sql.",
+}
 
 --- Creates a new AdapterProperties instance.
 -- @param raw table  Raw properties map (string → string), or nil for an empty set.
@@ -28,23 +33,27 @@ function AdapterProperties:new(raw)
     return setmetatable(instance, self)
 end
 
---- Validates that all required properties are present and non-empty.
--- Raises an error with an actionable message on the first missing property.
+--- Validates that all required properties are present and non-empty,
+-- and that no removed properties (e.g. OLLAMA_URL) are present.
+-- Raises an error with an actionable message on the first problem found.
 function AdapterProperties:validate()
+    for key, msg in pairs(REMOVED_PROPERTIES) do
+        local val = self:get(key)
+        if val ~= nil and val ~= "" then
+            error(msg, 2)
+        end
+    end
+
     local function require_property(key, hint)
         local val = self:get(key)
         if val == nil or val == "" then
-            local msg = ("Required virtual schema property '%s' is missing or empty."):format(key)
-            if hint then msg = msg .. " " .. hint end
-            error(msg, 2)
+            local err = ("Required virtual schema property '%s' is missing or empty."):format(key)
+            if hint then err = err .. " " .. hint end
+            error(err, 2)
         end
     end
     require_property(self.CONNECTION_NAME)
     require_property(self.QDRANT_MODEL)
-    require_property(self.OLLAMA_URL,
-        "Set OLLAMA_URL to your Ollama endpoint reachable from inside Exasol "
-        .. "(e.g. 'http://172.17.0.1:11434' for Docker bridge). "
-        .. "Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.")
 end
 
 --- Returns the value of the named property, or nil if absent.
@@ -57,20 +66,10 @@ function AdapterProperties:get_connection_name()
     return self:get(self.CONNECTION_NAME)
 end
 
---- Returns the Ollama model name used for embeddings.
+--- Returns the embedding model name (informational only — the actual model
+-- is hard-coded inside ADAPTER.SEARCH_QDRANT_LOCAL, but this is surfaced in diagnostics).
 function AdapterProperties:get_qdrant_model()
     return self:get(self.QDRANT_MODEL)
-end
-
---- Returns the Ollama base URL.
--- Raises an error if not set (no default — localhost never works in Docker).
-function AdapterProperties:get_ollama_url()
-    local val = self:get(self.OLLAMA_URL)
-    if val and val ~= "" then return val end
-    error("OLLAMA_URL property is not set. "
-        .. "Set it to your Ollama endpoint reachable from inside Exasol "
-        .. "(e.g. 'http://172.17.0.1:11434' for Docker bridge). "
-        .. "Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.", 2)
 end
 
 --- Returns the COLLECTION_FILTER value, or nil if not set.
@@ -90,11 +89,19 @@ function AdapterProperties:get_qdrant_url_override()
 end
 
 --- Merges these properties with new_raw, returning a fresh AdapterProperties.
--- New values override old ones. A new value of "" removes the property
--- (it will revert to its default or fail validation if required).
+-- New values override old ones. A new value of "" removes the property.
+-- Removed properties (e.g. OLLAMA_URL) raise an error if set to a non-empty
+-- value — operators must drop and re-create the virtual schema.
 -- @param new_raw table  New property key-value pairs
 -- @return AdapterProperties  Merged instance
 function AdapterProperties:merge(new_raw)
+    for key, msg in pairs(REMOVED_PROPERTIES) do
+        local val = new_raw[key]
+        if val ~= nil and val ~= "" then
+            error(msg, 2)
+        end
+    end
+
     local merged = {}
     for k, v in pairs(self._raw) do
         merged[k] = v

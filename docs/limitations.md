@@ -5,7 +5,7 @@
 | SQL statement | Status | Notes |
 |---|---|---|
 | `CREATE TABLE` | Via Python UDF | Use `SELECT ADAPTER.CREATE_QDRANT_COLLECTION(...)` |
-| `INSERT INTO` | Via Python UDF | Use `SELECT ADAPTER.EMBED_AND_PUSH(...) FROM ... GROUP BY IPROC()` |
+| `INSERT INTO` | Via Python UDF | Use `SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(...) FROM ... GROUP BY IPROC()` |
 | `DROP TABLE` | No-op | Dropping the virtual schema does NOT delete Qdrant collections |
 | `ALTER TABLE` | Not supported | Column schema is fixed: ID, TEXT, SCORE, QUERY |
 | `TRUNCATE` | Not supported | Delete points via the Qdrant API or dashboard directly |
@@ -103,7 +103,9 @@ curl -X PUT 'http://<qdrant_host>:6333/collections/<name>/index' \
 - The Qdrant collection does not have a text payload index (the prefetch/fusion
   request will fail, and the adapter does not retry with a simpler query)
 
-**Keyword extraction details:** The tokenizer splits query text on non-alphanumeric
+**Keyword extraction details:** Tokenization runs inside the
+`SEARCH_QDRANT_LOCAL` Python SET UDF (`exasol_udfs/search_qdrant_local.py`),
+not in the Lua adapter. The tokenizer splits query text on non-alphanumeric
 characters, lowercases all tokens, removes English stopwords (~100 common words),
 and deduplicates. Adjacent non-stopword pairs are also concatenated to generate
 compound tokens (e.g., "JP" + "Morgan" generates both "jp", "morgan", and
@@ -133,7 +135,9 @@ Exasol's Lua sandbox initialization (~80% of total time), not by the embedding
 or vector search (~150ms combined). This is a known characteristic of Exasol's
 UDF sandbox architecture.
 
-For sub-second latency, query Ollama and Qdrant directly via their HTTP APIs.
+For sub-second latency, query Qdrant directly via its HTTP API and embed
+client-side with `sentence-transformers` (matching the SLC's
+`nomic-embed-text-v1.5`, normalized).
 
 ---
 

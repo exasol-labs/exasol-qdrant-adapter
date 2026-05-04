@@ -8,12 +8,15 @@ Qdrant's vector search API. Users work entirely in SQL:
 | User story | SQL pattern |
 |---|---|
 | Create a vector collection | `SELECT ADAPTER.CREATE_QDRANT_COLLECTION(...)` |
-| Ingest data from Exasol | `SELECT ADAPTER.EMBED_AND_PUSH(...) FROM my_table GROUP BY IPROC()` |
+| Ingest data from Exasol | `SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(...) FROM my_table GROUP BY IPROC()` |
 | Similarity search | `SELECT "ID", "TEXT", "SCORE" FROM vector_schema.table WHERE "QUERY" = '...' LIMIT k` |
 
 > **Note:** The Exasol Virtual Schema framework forwards only SELECT queries as push-downs.
 > Data ingestion is handled by companion Python UDFs (`CREATE_QDRANT_COLLECTION`
-> and `EMBED_AND_PUSH`) that embed text via Ollama and upsert vectors into Qdrant.
+> and `EMBED_AND_PUSH_LOCAL`) that embed text in-process via the BucketFS-resident
+> SLC + model and upsert vectors into Qdrant. Query-time embedding and Qdrant
+> hybrid search are also in-process — the Lua adapter generates pushdown SQL
+> that calls `ADAPTER.SEARCH_QDRANT_LOCAL`, which owns the entire query path.
 
 ---
 
@@ -41,24 +44,24 @@ If the collection already exists, `CREATE_QDRANT_COLLECTION` returns `'exists: a
 
 ```sql
 -- Embed and push rows from an Exasol table into Qdrant
-SELECT ADAPTER.EMBED_AND_PUSH(
-    CAST(doc_id AS VARCHAR(36)),    -- unique ID column
-    doc_text,                        -- text column to embed
-    '172.17.0.1', 6333, '',         -- Qdrant host, port, API key
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
+    'embedding_conn',                -- CONNECTION object with Qdrant URL
     'articles',                      -- collection name
-    'ollama',                        -- provider
-    'http://172.17.0.4:11434',       -- Ollama URL
-    'nomic-embed-text'               -- model
+    CAST(doc_id AS VARCHAR(36)),     -- unique ID column
+    doc_text                         -- text column to embed
 )
 FROM MY_SCHEMA.DOCUMENTS
 GROUP BY IPROC();
 ```
 
-`GROUP BY IPROC()` is required for SET UDFs — it distributes work across Exasol cluster nodes. The UDF returns one summary row per node: `(partition_id, upserted_count)`.
+`GROUP BY IPROC()` is required for SET UDFs — it distributes work across Exasol
+cluster nodes. The UDF returns one summary row per partition:
+`(partition_id, upserted_count)`.
 
 Duplicate IDs are handled as upserts (the existing point is overwritten).
 
-See [udf-ingestion.md](udf-ingestion.md) for the full parameter reference, OpenAI provider usage, and troubleshooting.
+See [udf-ingestion.md](udf-ingestion.md) for the full parameter reference,
+CONNECTION JSON fields, and troubleshooting.
 
 ---
 
@@ -91,7 +94,12 @@ WHERE "QUERY" = 'machine learning' AND "SCORE" > 0.6 LIMIT 5;
 
 ### Performance note
 
-Each query takes approximately **5–8 seconds**. This latency is dominated by Exasol's Lua sandbox initialization (~80% of total time), not by the embedding or vector search (~150ms combined). For sub-second latency, query Ollama and Qdrant directly via their HTTP APIs.
+After the first call in a UDF VM, each query takes approximately **5–8 seconds**.
+This latency is dominated by Exasol's Lua sandbox initialization (~80% of total
+time), not by the embedding (~50–150 ms warm) or vector search (~50–100 ms).
+The first query in a freshly recycled VM additionally pays a 3–8 s model-load
+cost from BucketFS. For sub-second latency, query Qdrant directly via its HTTP
+API and embed client-side.
 
 ---
 
@@ -114,18 +122,21 @@ ORDER BY s."SCORE" DESC;
 
 ## Virtual schema properties
 
-| Property          | Required | Default                  | Description                                      |
-| ----------------- | -------- | ------------------------ | ------------------------------------------------ |
-| `CONNECTION_NAME`   | Yes      | --                       | Exasol CONNECTION object with Qdrant URL         |
-| `QDRANT_MODEL`      | Yes      | --                       | Ollama model name for embeddings                 |
-| `OLLAMA_URL`        | Yes      | --                       | Ollama base URL reachable from Exasol (e.g. `http://172.17.0.1:11434` for Docker) |
-| `QDRANT_URL`        | No       | --                       | Override Qdrant URL (ignores CONNECTION address)  |
-| `COLLECTION_FILTER` | No       | -- (all collections)     | Comma-separated list of collection names or glob patterns to expose |
+| Property            | Required | Default              | Description                                                          |
+| ------------------- | -------- | -------------------- | -------------------------------------------------------------------- |
+| `CONNECTION_NAME`   | Yes      | --                   | Exasol CONNECTION object with Qdrant URL                             |
+| `QDRANT_MODEL`      | Yes      | --                   | Embedding model name (informational; surfaced in diagnostic errors)  |
+| `QDRANT_URL`        | No       | --                   | Override Qdrant URL (ignores CONNECTION address)                     |
+| `COLLECTION_FILTER` | No       | -- (all collections) | Comma-separated list of collection names or glob patterns to expose  |
+
+> **Removed property:** `OLLAMA_URL` is no longer accepted. Use of
+> `OLLAMA_URL` raises a clear migration error — drop and re-create the
+> virtual schema after running `scripts/install_all.sql`.
 
 Change properties without dropping the schema:
 
 ```sql
-ALTER VIRTUAL SCHEMA vector_schema SET OLLAMA_URL = 'http://172.17.0.4:11434';
+ALTER VIRTUAL SCHEMA vector_schema SET COLLECTION_FILTER = 'bank_*';
 ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 ```
 

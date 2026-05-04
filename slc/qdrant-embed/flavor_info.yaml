@@ -1,0 +1,15 @@
+# Custom flavor for ADAPTER.EMBED_AND_PUSH_LOCAL.
+#
+# Extends a current Exasol Python 3.10 base flavor (e.g.
+# standard-EXASOL-all-python-3.10) from
+# https://github.com/exasol/script-languages-release. The build helper
+# scripts/build_and_upload_slc.sh checks out script-languages-release,
+# overlays this directory's flavor_customization/, and runs
+# `exaslct export`.
+#
+# Pin the script-languages-release tag here so the build is reproducible.
+# Bump this when the deployed Exasol version moves; keep it aligned with
+# the production cluster.
+flavor_name: qdrant-embed
+base_flavor: standard-EXASOL-all-python-3.10
+script_languages_release_ref: "11.1.1"

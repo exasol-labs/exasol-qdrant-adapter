@@ -71,16 +71,14 @@ function QdrantAdapter:set_properties(request)
     return {type = "setProperties", schemaMetadata = {tables = tables}}
 end
 
---- Handles pushDown: embed the query via Ollama, search Qdrant, return VALUES SQL.
+--- Handles pushDown: build SQL that calls ADAPTER.SEARCH_QDRANT_LOCAL. The
+-- SET UDF owns embedding + Qdrant search; the adapter never runs SQL/HTTP
+-- itself during pushdown (Exasol forbids exa.pquery_no_preprocessing here).
 function QdrantAdapter:push_down(request)
     local props = self:_load_properties(request)
     props:validate()
 
-    local qdrant_url, api_key = self:_resolve_connection(props)
-    local ollama_url = props:get_ollama_url()
-    local model      = props:get_qdrant_model()
-
-    local rewriter = QueryRewriter:new(qdrant_url, ollama_url, model, api_key)
+    local rewriter = QueryRewriter:new(props:get_connection_name())
     local sql = rewriter:rewrite(request)
     return {type = "pushdown", sql = sql}
 end
