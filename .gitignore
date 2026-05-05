@@ -9,3 +9,20 @@ SKILLS/
 openspec/
 ux-pipeline/
 future.md
+prototype.sql
+
+# SLC build outputs (slc/qdrant-embed)
+out/
+*.tar.gz
+slc/**/script-languages-release/
+slc/**/.build_output/
+slc_build/
+.exaslct/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / agent state
+.serena/

@@ -1,19 +1,3 @@
--- Exasol's built-in require() ignores package.preload. Patch it so that
--- amalg-bundled modules are found before falling back to the original loader.
-local _original_require = require
-require = function(modname)
-    if package.loaded[modname] then return package.loaded[modname] end
-    local preload_fn = package.preload[modname]
-    if preload_fn then
-        local ok, result = pcall(preload_fn, modname)
-        if not ok then
-            error("Failed loading bundled module [" .. modname .. "]: " .. tostring(result), 2)
-        end
-        package.loaded[modname] = result == nil and true or result
-        return package.loaded[modname]
-    end
-    return _original_require(modname)
-end
 do
 local _ENV = _ENV
 package.preload[ "ExaError" ] = function( ... ) local arg = _G.arg;
@@ -365,12 +349,19 @@ AdapterProperties.__index = AdapterProperties
 setmetatable(AdapterProperties, {__index = base_props})
 
 -- Property key constants
-AdapterProperties.CONNECTION_NAME = "CONNECTION_NAME"
-AdapterProperties.QDRANT_MODEL    = "QDRANT_MODEL"
-AdapterProperties.OLLAMA_URL      = "OLLAMA_URL"
-AdapterProperties.QDRANT_URL      = "QDRANT_URL"
+AdapterProperties.CONNECTION_NAME    = "CONNECTION_NAME"
+AdapterProperties.QDRANT_MODEL       = "QDRANT_MODEL"
+AdapterProperties.QDRANT_URL         = "QDRANT_URL"
+AdapterProperties.COLLECTION_FILTER  = "COLLECTION_FILTER"
 
-local DEFAULT_OLLAMA_URL = "http://localhost:11434"
+-- Properties that have been removed and SHALL be rejected if encountered.
+-- Maps key → migration message.
+local REMOVED_PROPERTIES = {
+    OLLAMA_URL = "OLLAMA_URL is no longer supported — the query path now embeds "
+        .. "in-database via ADAPTER.SEARCH_QDRANT_LOCAL (no Ollama process is required). "
+        .. "Drop and re-create the virtual schema without OLLAMA_URL after running "
+        .. "scripts/install_all.sql.",
+}
 
 --- Creates a new AdapterProperties instance.
 -- @param raw table  Raw properties map (string → string), or nil for an empty set.
@@ -382,13 +373,23 @@ function AdapterProperties:new(raw)
     return setmetatable(instance, self)
 end
 
---- Validates that all required properties are present and non-empty.
--- Raises an error with an actionable message on the first missing property.
+--- Validates that all required properties are present and non-empty,
+-- and that no removed properties (e.g. OLLAMA_URL) are present.
+-- Raises an error with an actionable message on the first problem found.
 function AdapterProperties:validate()
-    local function require_property(key)
+    for key, msg in pairs(REMOVED_PROPERTIES) do
+        local val = self:get(key)
+        if val ~= nil and val ~= "" then
+            error(msg, 2)
+        end
+    end
+
+    local function require_property(key, hint)
         local val = self:get(key)
         if val == nil or val == "" then
-            error(("Required virtual schema property '%s' is missing or empty."):format(key), 2)
+            local err = ("Required virtual schema property '%s' is missing or empty."):format(key)
+            if hint then err = err .. " " .. hint end
+            error(err, 2)
         end
     end
     require_property(self.CONNECTION_NAME)
@@ -405,16 +406,18 @@ function AdapterProperties:get_connection_name()
     return self:get(self.CONNECTION_NAME)
 end
 
---- Returns the Ollama model name used for embeddings.
+--- Returns the embedding model name (informational only — the actual model
+-- is hard-coded inside ADAPTER.SEARCH_QDRANT_LOCAL, but this is surfaced in diagnostics).
 function AdapterProperties:get_qdrant_model()
     return self:get(self.QDRANT_MODEL)
 end
 
---- Returns the Ollama base URL, defaulting to http://localhost:11434 if not set.
-function AdapterProperties:get_ollama_url()
-    local val = self:get(self.OLLAMA_URL)
+--- Returns the COLLECTION_FILTER value, or nil if not set.
+-- Comma-separated list of collection names or glob patterns (e.g. "bank_*,products").
+function AdapterProperties:get_collection_filter()
+    local val = self:get(self.COLLECTION_FILTER)
     if val and val ~= "" then return val end
-    return DEFAULT_OLLAMA_URL
+    return nil
 end
 
 --- Returns an explicit Qdrant URL override, or nil if not set.
@@ -426,11 +429,19 @@ function AdapterProperties:get_qdrant_url_override()
 end
 
 --- Merges these properties with new_raw, returning a fresh AdapterProperties.
--- New values override old ones. A new value of "" removes the property
--- (it will revert to its default or fail validation if required).
+-- New values override old ones. A new value of "" removes the property.
+-- Removed properties (e.g. OLLAMA_URL) raise an error if set to a non-empty
+-- value — operators must drop and re-create the virtual schema.
 -- @param new_raw table  New property key-value pairs
 -- @return AdapterProperties  Merged instance
 function AdapterProperties:merge(new_raw)
+    for key, msg in pairs(REMOVED_PROPERTIES) do
+        local val = new_raw[key]
+        if val ~= nil and val ~= "" then
+            error(msg, 2)
+        end
+    end
+
     local merged = {}
     for k, v in pairs(self._raw) do
         merged[k] = v
@@ -469,18 +480,49 @@ local COLUMNS = {
 }
 
 --- Creates a new MetadataReader.
--- @param qdrant_url string  Qdrant base URL (no trailing slash)
--- @param api_key    string  Qdrant API key, or "" if not required
-function MetadataReader:new(qdrant_url, api_key)
+-- @param qdrant_url         string  Qdrant base URL (no trailing slash)
+-- @param api_key            string  Qdrant API key, or "" if not required
+-- @param collection_filter  string  Comma-separated list of collection names or
+--                                   glob patterns (e.g. "bank_*,products"), or nil for all
+function MetadataReader:new(qdrant_url, api_key, collection_filter)
     return setmetatable({
-        _qdrant_url = qdrant_url,
-        _api_key    = api_key or "",
+        _qdrant_url        = qdrant_url,
+        _api_key           = api_key or "",
+        _collection_filter = collection_filter,
     }, self)
+end
+
+--- Converts a simple glob pattern (supporting * and ?) to a Lua pattern.
+local function _glob_to_pattern(glob)
+    local pattern = glob:gsub("([%.%+%-%^%$%(%)%%])", "%%%1")
+    pattern = pattern:gsub("%*", ".*")
+    pattern = pattern:gsub("%?", ".")
+    return "^" .. pattern .. "$"
+end
+
+--- Tests whether a collection name matches the filter string.
+-- The filter is a comma-separated list of names or glob patterns.
+-- Returns true if any pattern matches, or if filter is nil/empty.
+function MetadataReader:_matches_filter(name)
+    if not self._collection_filter or type(self._collection_filter) ~= "string" or self._collection_filter == "" then
+        return true
+    end
+    for entry in self._collection_filter:gmatch("[^,]+") do
+        local pattern = entry:match("^%s*(.-)%s*$")  -- trim whitespace
+        if pattern ~= "" then
+            local lua_pattern = _glob_to_pattern(pattern)
+            if name:match(lua_pattern) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 --- Reads collection names from Qdrant and returns a list of table metadata tables.
 -- Returns an empty list when Qdrant has no collections.
 -- Raises an error if the HTTP call fails.
+-- If a COLLECTION_FILTER was provided, only matching collections are included.
 -- @return table  List of {name=string, columns=list} tables
 function MetadataReader:read()
     local headers = {}
@@ -493,7 +535,7 @@ function MetadataReader:read()
     local tables = {}
     local collections = (response.result or {}).collections or {}
     for _, col in ipairs(collections) do
-        if col.name then
+        if col.name and self:_matches_filter(col.name) then
             tables[#tables + 1] = {
                 name    = col.name:upper(),
                 columns = COLUMNS,
@@ -583,16 +625,14 @@ function QdrantAdapter:set_properties(request)
     return {type = "setProperties", schemaMetadata = {tables = tables}}
 end
 
---- Handles pushDown: embed the query via Ollama, search Qdrant, return VALUES SQL.
+--- Handles pushDown: build SQL that calls ADAPTER.SEARCH_QDRANT_LOCAL. The
+-- SET UDF owns embedding + Qdrant search; the adapter never runs SQL/HTTP
+-- itself during pushdown (Exasol forbids exa.pquery_no_preprocessing here).
 function QdrantAdapter:push_down(request)
     local props = self:_load_properties(request)
     props:validate()
 
-    local qdrant_url, api_key = self:_resolve_connection(props)
-    local ollama_url = props:get_ollama_url()
-    local model      = props:get_qdrant_model()
-
-    local rewriter = QueryRewriter:new(qdrant_url, ollama_url, model, api_key)
+    local rewriter = QueryRewriter:new(props:get_connection_name())
     local sql = rewriter:rewrite(request)
     return {type = "pushdown", sql = sql}
 end
@@ -640,11 +680,13 @@ end
 do
 local _ENV = _ENV
 package.preload[ "adapter.QueryRewriter" ] = function( ... ) local arg = _G.arg;
---- QueryRewriter: embeds a query string via Ollama, searches Qdrant for
--- similar vectors, and returns a VALUES-based SELECT statement that
--- Exasol can materialise as a result set.
-
-local http = require("util.http")
+--- QueryRewriter: builds the pushdown SQL response.
+--
+-- Returns SQL that calls ADAPTER.SEARCH_QDRANT_LOCAL (a SET UDF). All embed +
+-- Qdrant search work happens inside that UDF when Exasol executes the
+-- returned SQL — the Lua adapter never runs SQL or HTTP itself during
+-- pushdown (Exasol forbids exa.pquery_no_preprocessing in pushdown context,
+-- and the canonical workaround is a row-emitting UDF).
 
 local QueryRewriter = {}
 QueryRewriter.__index = QueryRewriter
@@ -652,31 +694,25 @@ QueryRewriter.__index = QueryRewriter
 local DEFAULT_LIMIT = 10
 
 --- Creates a new QueryRewriter.
--- @param qdrant_url  string  Qdrant base URL (no trailing slash)
--- @param ollama_url  string  Ollama base URL (no trailing slash)
--- @param model       string  Ollama model name for embeddings
--- @param api_key     string  Qdrant API key, or "" if not required
-function QueryRewriter:new(qdrant_url, ollama_url, model, api_key)
+-- @param connection_name string  Exasol CONNECTION name pointing at Qdrant
+--                                (passed through to SEARCH_QDRANT_LOCAL).
+function QueryRewriter:new(connection_name)
     return setmetatable({
-        _qdrant_url = qdrant_url,
-        _ollama_url = ollama_url,
-        _model      = model,
-        _api_key    = api_key or "",
+        _connection_name = connection_name,
     }, self)
 end
 
 --- Rewrites a push-down request to a SQL string.
--- @param request table  Parsed pushDown request (from virtual-schema-common-lua)
--- @return string        SQL suitable for the pushDown response
 function QueryRewriter:rewrite(request)
     local collection = self:_extract_collection(request)
-    local query_text = self:_extract_query_text(request)
+    local query_text, unsupported = self:_extract_query_text(request)
     local limit      = self:_extract_limit(request)
 
-    local embedding = self:_embed(query_text)
-    local results   = self:_search(collection, embedding, limit)
+    if query_text == nil or query_text == "" then
+        return self:_build_empty_query_hint(collection, unsupported)
+    end
 
-    return self:_build_sql(query_text, results)
+    return self:_build_search_sql(collection, query_text, limit)
 end
 
 -- ─────────────────────────────────────────────
@@ -687,34 +723,26 @@ function QueryRewriter:_extract_collection(request)
     if not tables[1] then
         error("pushDown request contains no involved tables")
     end
-    -- Qdrant collection names are lowercase; virtual table names are uppercase.
     return tables[1].name:lower()
 end
 
 function QueryRewriter:_extract_query_text(request)
     local push = request.pushdownRequest or {}
-    if not push.filter then return "" end
-    return self:_walk_filter(push.filter) or ""
-end
-
---- Walks the filter AST looking for QUERY = '<literal>' (or '<literal>' = QUERY).
-function QueryRewriter:_walk_filter(node)
-    if not node then return nil end
-    if node.type == "predicate_equal" then
-        local left  = node.left  or {}
-        local right = node.right or {}
-        -- QUERY = 'text'
+    if not push.filter then return "", false end
+    if push.filter.type == "predicate_equal" then
+        local left  = push.filter.left  or {}
+        local right = push.filter.right or {}
         if left.type == "column" and left.name and left.name:upper() == "QUERY"
            and right.type == "literal_string" then
-            return right.value
+            return right.value, false
         end
-        -- 'text' = QUERY
         if right.type == "column" and right.name and right.name:upper() == "QUERY"
            and left.type == "literal_string" then
-            return left.value
+            return left.value, false
         end
+        return "", true
     end
-    return nil
+    return "", true
 end
 
 function QueryRewriter:_extract_limit(request)
@@ -726,106 +754,49 @@ function QueryRewriter:_extract_limit(request)
 end
 
 -- ─────────────────────────────────────────────
--- HTTP calls
-
---- Calls Ollama /api/embeddings and returns the embedding float array.
-function QueryRewriter:_embed(query_text)
-    local url = self._ollama_url .. "/api/embeddings"
-    local response = http.post_json(url, {
-        model  = self._model,
-        prompt = query_text,
-    })
-    local embedding = response.embedding
-    if not embedding or type(embedding) ~= "table" or #embedding == 0 then
-        error("Ollama returned no embedding for model '" .. self._model .. "'")
-    end
-    return embedding
-end
-
---- Serialises a float array from a cjson-decoded table into a JSON array string.
-local function embedding_to_json(embedding)
-    local n = #embedding
-    if n == 0 then
-        -- Diagnostic: check actual table contents
-        local info = "len=" .. tostring(n) .. " type=" .. type(embedding)
-        local cnt = 0
-        for k, _ in pairs(embedding) do cnt = cnt + 1 end
-        info = info .. " pairs_count=" .. cnt
-        if cnt > 0 then
-            for k, v in pairs(embedding) do
-                info = info .. " sample_k=" .. tostring(k) .. "(" .. type(k) .. ")"
-                break
-            end
-        end
-        error("embedding array is empty: " .. info)
-    end
-    local parts = {}
-    for i = 1, n do parts[i] = tostring(embedding[i]) end
-    return "[" .. table.concat(parts, ",") .. "]"
-end
-
---- Calls Qdrant /collections/{name}/points/query and returns result rows.
-function QueryRewriter:_search(collection, vector, limit)
-    local url = string.format("%s/collections/%s/points/query",
-                              self._qdrant_url, collection)
-    local headers = {}
-    if self._api_key ~= "" then
-        headers["api-key"] = self._api_key
-    end
-
-    local body = string.format(
-        '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
-        embedding_to_json(vector), limit
-    )
-    local response = http.post_raw(url, body, headers)
-
-    local rows = {}
-    for _, point in ipairs((response.result or {}).points or {}) do
-        local payload = point.payload or {}
-        rows[#rows + 1] = {
-            id    = tostring(payload._original_id or point.id or ""),
-            text  = tostring(payload.text or ""),
-            score = tonumber(point.score) or 0.0,
-        }
-    end
-    return rows
-end
-
--- ─────────────────────────────────────────────
 -- SQL builders
 
 local function sql_escape(s)
     return (s or ""):gsub("'", "''")
 end
 
---- Builds the push-down SQL for non-empty results (VALUES clause).
--- For zero results, returns an empty-result query that preserves column types.
-function QueryRewriter:_build_sql(query_text, results)
-    if #results == 0 then
-        return "SELECT"
-            .. " CAST('' AS VARCHAR(36) UTF8) AS ID,"
-            .. " CAST('' AS VARCHAR(2000000) UTF8) AS TEXT,"
-            .. " CAST(0 AS DOUBLE) AS SCORE,"
-            .. " CAST('' AS VARCHAR(2000000) UTF8) AS QUERY"
-            .. " FROM DUAL WHERE FALSE"
+--- Returns a single-row hint when no supported QUERY predicate was provided.
+function QueryRewriter:_build_empty_query_hint(collection, unsupported_filter)
+    local hint
+    if unsupported_filter then
+        hint = "Unsupported predicate. Only WHERE \"QUERY\" = 'your search text' is supported."
+            .. " LIKE, >, <, AND, OR are not supported."
+            .. " Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema."
+            .. collection .. " WHERE \"QUERY\" = 'your search' LIMIT 10"
+    else
+        hint = "Semantic search requires: WHERE \"QUERY\" = 'your search text'."
+            .. " Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema."
+            .. collection .. " WHERE \"QUERY\" = 'your search' LIMIT 10"
     end
+    hint = sql_escape(hint)
+    local query_hint = sql_escape(
+        "Only equality predicates on QUERY are supported: WHERE \"QUERY\" = 'your text'")
+    return "SELECT * FROM VALUES"
+        .. " (CAST('HINT' AS VARCHAR(2000000) UTF8),"
+        .. " CAST('" .. hint .. "' AS VARCHAR(2000000) UTF8),"
+        .. " CAST(1 AS DOUBLE),"
+        .. " CAST('" .. query_hint .. "' AS VARCHAR(2000000) UTF8))"
+        .. " AS t(ID, TEXT, SCORE, QUERY)"
+end
 
-    local rows = {}
-    local q = sql_escape(query_text)
-    for _, r in ipairs(results) do
-        rows[#rows + 1] = string.format(
-            "(CAST('%s' AS VARCHAR(2000000) UTF8),"
-            .. "CAST('%s' AS VARCHAR(2000000) UTF8),"
-            .. "CAST(%s AS DOUBLE),"
-            .. "CAST('%s' AS VARCHAR(2000000) UTF8))",
-            sql_escape(r.id),
-            sql_escape(r.text),
-            tostring(r.score),
-            q
-        )
-    end
-
-    return "SELECT * FROM VALUES " .. table.concat(rows, ",") .. " AS t(ID, TEXT, SCORE, QUERY)"
+--- Generates the SET-UDF call wrapped to expose the (ID, TEXT, SCORE, QUERY)
+-- column projection the virtual schema declares.
+function QueryRewriter:_build_search_sql(collection, query_text, limit)
+    return string.format(
+        "SELECT result_id AS \"ID\", result_text AS \"TEXT\","
+        .. " result_score AS \"SCORE\", result_query AS \"QUERY\""
+        .. " FROM (SELECT ADAPTER.SEARCH_QDRANT_LOCAL("
+        .. "'%s', '%s', '%s', %d) FROM DUAL)",
+        sql_escape(self._connection_name),
+        sql_escape(collection),
+        sql_escape(query_text),
+        limit
+    )
 end
 
 return QueryRewriter
@@ -3514,6 +3485,11 @@ end
 --- Thin entrypoint for the Qdrant Virtual Schema Lua adapter.
 -- Defines the global adapter_call() function required by Exasol.
 -- Contains no business logic — all requests are delegated to RequestDispatcher.
+
+-- Adapter version: update this on each release for deployment tracking.
+-- Queryable via: SELECT SCRIPT_TEXT FROM SYS.EXA_ALL_SCRIPTS
+--                WHERE SCRIPT_NAME = 'QDRANT_ADAPTER' AND SCRIPT_SCHEMA = 'ADAPTER';
+local ADAPTER_VERSION = "2.1.0"
 
 local QdrantAdapter    = require("adapter.QdrantAdapter")
 local AdapterProperties = require("adapter.AdapterProperties")

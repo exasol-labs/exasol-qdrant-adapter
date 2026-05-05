@@ -6,7 +6,7 @@ This document records the known downsides of replacing the Java adapter with a L
 
 ## 1. No Custom TLS / Self-Signed Certificates
 
-**What breaks:** Qdrant or Ollama endpoints secured with self-signed certificates or a private CA.
+**What breaks:** Qdrant endpoints secured with self-signed certificates or a private CA. (The original "Ollama endpoints" wording is now moot — Ollama is no longer in the data path; embedding happens in-process via the SLC + BucketFS model.)
 
 **Why:** Lua adapters run inside Exasol's UDF sandbox, which has no filesystem access. There is no way to load a custom CA bundle or a client certificate at runtime.
 
@@ -34,7 +34,7 @@ This document records the known downsides of replacing the Java adapter with a L
 
 **Why:** Each `adapter_call()` invocation is independent. No globals survive between calls.
 
-**Impact for this adapter:** Each push-down makes fresh HTTP calls to Ollama and Qdrant. At low query volumes this is acceptable.
+**Impact for this adapter:** The Lua adapter itself makes no HTTP calls during pushdown — it generates SQL that calls `ADAPTER.SEARCH_QDRANT_LOCAL`, and that Python SET UDF embeds the query and calls Qdrant. Each pushdown still pays the UDF VM cost (model loaded once per VM, then reused).
 
 ---
 

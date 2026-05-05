@@ -1,9 +1,10 @@
---- QueryRewriter: embeds a query string via Ollama, searches Qdrant for
--- similar vectors, and returns a VALUES-based SELECT statement that
--- Exasol can materialise as a result set.
-
-local http = require("util.http")
-local tokenizer = require("adapter.tokenizer")
+--- QueryRewriter: builds the pushdown SQL response.
+--
+-- Returns SQL that calls ADAPTER.SEARCH_QDRANT_LOCAL (a SET UDF). All embed +
+-- Qdrant search work happens inside that UDF when Exasol executes the
+-- returned SQL — the Lua adapter never runs SQL or HTTP itself during
+-- pushdown (Exasol forbids exa.pquery_no_preprocessing in pushdown context,
+-- and the canonical workaround is a row-emitting UDF).
 
 local QueryRewriter = {}
 QueryRewriter.__index = QueryRewriter
@@ -11,37 +12,25 @@ QueryRewriter.__index = QueryRewriter
 local DEFAULT_LIMIT = 10
 
 --- Creates a new QueryRewriter.
--- @param qdrant_url  string  Qdrant base URL (no trailing slash)
--- @param ollama_url  string  Ollama base URL (no trailing slash)
--- @param model       string  Ollama model name for embeddings
--- @param api_key     string  Qdrant API key, or "" if not required
-function QueryRewriter:new(qdrant_url, ollama_url, model, api_key)
+-- @param connection_name string  Exasol CONNECTION name pointing at Qdrant
+--                                (passed through to SEARCH_QDRANT_LOCAL).
+function QueryRewriter:new(connection_name)
     return setmetatable({
-        _qdrant_url = qdrant_url,
-        _ollama_url = ollama_url,
-        _model      = model,
-        _api_key    = api_key or "",
+        _connection_name = connection_name,
     }, self)
 end
 
 --- Rewrites a push-down request to a SQL string.
--- @param request table  Parsed pushDown request (from virtual-schema-common-lua)
--- @return string        SQL suitable for the pushDown response
 function QueryRewriter:rewrite(request)
     local collection = self:_extract_collection(request)
-    local query_text = self:_extract_query_text(request)
+    local query_text, unsupported = self:_extract_query_text(request)
     local limit      = self:_extract_limit(request)
 
-    -- Graceful empty-query handling: if no WHERE "QUERY" = '...' clause was
-    -- provided, return a single-row hint instead of crashing on Ollama.
     if query_text == nil or query_text == "" then
-        return self:_build_empty_query_hint(collection)
+        return self:_build_empty_query_hint(collection, unsupported)
     end
 
-    local embedding = self:_embed(query_text)
-    local results   = self:_search(collection, embedding, limit, query_text)
-
-    return self:_build_sql(query_text, results)
+    return self:_build_search_sql(collection, query_text, limit)
 end
 
 -- ─────────────────────────────────────────────
@@ -52,34 +41,26 @@ function QueryRewriter:_extract_collection(request)
     if not tables[1] then
         error("pushDown request contains no involved tables")
     end
-    -- Qdrant collection names are lowercase; virtual table names are uppercase.
     return tables[1].name:lower()
 end
 
 function QueryRewriter:_extract_query_text(request)
     local push = request.pushdownRequest or {}
-    if not push.filter then return "" end
-    return self:_walk_filter(push.filter) or ""
-end
-
---- Walks the filter AST looking for QUERY = '<literal>' (or '<literal>' = QUERY).
-function QueryRewriter:_walk_filter(node)
-    if not node then return nil end
-    if node.type == "predicate_equal" then
-        local left  = node.left  or {}
-        local right = node.right or {}
-        -- QUERY = 'text'
+    if not push.filter then return "", false end
+    if push.filter.type == "predicate_equal" then
+        local left  = push.filter.left  or {}
+        local right = push.filter.right or {}
         if left.type == "column" and left.name and left.name:upper() == "QUERY"
            and right.type == "literal_string" then
-            return right.value
+            return right.value, false
         end
-        -- 'text' = QUERY
         if right.type == "column" and right.name and right.name:upper() == "QUERY"
            and left.type == "literal_string" then
-            return left.value
+            return left.value, false
         end
+        return "", true
     end
-    return nil
+    return "", true
 end
 
 function QueryRewriter:_extract_limit(request)
@@ -91,133 +72,28 @@ function QueryRewriter:_extract_limit(request)
 end
 
 -- ─────────────────────────────────────────────
--- HTTP calls
-
---- Calls Ollama /api/embeddings and returns the embedding float array.
-function QueryRewriter:_embed(query_text)
-    local url = self._ollama_url .. "/api/embeddings"
-    local response = http.post_json(url, {
-        model  = self._model,
-        prompt = query_text,
-    })
-    local embedding = response.embedding
-    if not embedding or type(embedding) ~= "table" or #embedding == 0 then
-        error("Ollama returned no embedding for model '" .. self._model .. "'")
-    end
-    return embedding
-end
-
---- Serialises a float array from a cjson-decoded table into a JSON array string.
-local function embedding_to_json(embedding)
-    local n = #embedding
-    if n == 0 then
-        -- Diagnostic: check actual table contents
-        local info = "len=" .. tostring(n) .. " type=" .. type(embedding)
-        local cnt = 0
-        for k, _ in pairs(embedding) do cnt = cnt + 1 end
-        info = info .. " pairs_count=" .. cnt
-        if cnt > 0 then
-            for k, v in pairs(embedding) do
-                info = info .. " sample_k=" .. tostring(k) .. "(" .. type(k) .. ")"
-                break
-            end
-        end
-        error("embedding array is empty: " .. info)
-    end
-    local parts = {}
-    for i = 1, n do parts[i] = tostring(embedding[i]) end
-    return "[" .. table.concat(parts, ",") .. "]"
-end
-
---- Calls Qdrant /collections/{name}/points/query and returns result rows.
--- Uses hybrid search (vector + keyword RRF fusion) when query_text
--- contains meaningful keywords; falls back to pure vector search otherwise.
-function QueryRewriter:_search(collection, vector, limit, query_text)
-    local url = string.format("%s/collections/%s/points/query",
-                              self._qdrant_url, collection)
-    local headers = {}
-    if self._api_key ~= "" then
-        headers["api-key"] = self._api_key
-    end
-
-    local emb_json = embedding_to_json(vector)
-    local keywords = tokenizer.extract_keywords(query_text or "")
-
-    local body
-    if #keywords > 0 then
-        body = self:_build_hybrid_body(emb_json, keywords, limit)
-    else
-        body = self:_build_vector_body(emb_json, limit)
-    end
-
-    local response = http.post_raw(url, body, headers)
-
-    local rows = {}
-    for _, point in ipairs((response.result or {}).points or {}) do
-        local payload = point.payload or {}
-        rows[#rows + 1] = {
-            id    = tostring(payload._original_id or point.id or ""),
-            text  = tostring(payload.text or ""),
-            score = tonumber(point.score) or 0.0,
-        }
-    end
-    return rows
-end
-
---- Builds a pure vector query body (fallback when no keywords extracted).
-function QueryRewriter:_build_vector_body(emb_json, limit)
-    return string.format(
-        '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
-        emb_json, limit
-    )
-end
-
---- Builds a hybrid prefetch + RRF fusion body.
--- Creates one prefetch leg for pure vector search, plus one additional
--- prefetch leg per keyword (each filtered to results containing that keyword).
--- Qdrant fuses all rankings using Reciprocal Rank Fusion. This naturally
--- weights rare keywords higher than ubiquitous ones: a keyword matching
--- 3/544 documents produces a focused ranking that strongly boosts those
--- documents, while a keyword matching 530/544 adds almost no signal.
-function QueryRewriter:_build_hybrid_body(emb_json, keywords, limit)
-    local vector_limit  = math.max(limit * 10, 50)
-    local keyword_limit = math.max(limit * 4, 20)
-
-    local legs = {}
-    -- Leg 1: pure vector search (broad)
-    legs[1] = string.format(
-        '{"query":%s,"using":"text","limit":%d}',
-        emb_json, vector_limit
-    )
-    -- One leg per keyword, each with a must filter
-    for _, kw in ipairs(keywords) do
-        local escaped = kw:gsub('"', '\\"')
-        legs[#legs + 1] = string.format(
-            '{"query":%s,"using":"text","limit":%d,"filter":{"must":[{"key":"text","match":{"text":"%s"}}]}}',
-            emb_json, keyword_limit, escaped
-        )
-    end
-
-    return string.format(
-        '{"prefetch":[%s],"query":{"fusion":"rrf"},"limit":%d,"with_payload":true}',
-        table.concat(legs, ","), limit
-    )
-end
-
--- ─────────────────────────────────────────────
 -- SQL builders
 
---- Returns a single-row hint when no query text was provided.
--- Sets SCORE=1 and QUERY to a descriptive string so the hint row
--- survives post-pushdown filtering (e.g. WHERE SCORE > 0.5 or LIKE).
-function QueryRewriter:_build_empty_query_hint(collection)
-    local hint = "Semantic search requires: WHERE \"QUERY\" = 'your search text'."
-        .. " Only equality predicates on QUERY are supported (no LIKE, >, <, AND, OR)."
-        .. " Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema."
-        .. collection .. " WHERE \"QUERY\" = 'your search' LIMIT 10"
-    hint = hint:gsub("'", "''")
-    local query_hint = "Only equality predicates on QUERY are supported: WHERE \"QUERY\" = 'your text'"
-    query_hint = query_hint:gsub("'", "''")
+local function sql_escape(s)
+    return (s or ""):gsub("'", "''")
+end
+
+--- Returns a single-row hint when no supported QUERY predicate was provided.
+function QueryRewriter:_build_empty_query_hint(collection, unsupported_filter)
+    local hint
+    if unsupported_filter then
+        hint = "Unsupported predicate. Only WHERE \"QUERY\" = 'your search text' is supported."
+            .. " LIKE, >, <, AND, OR are not supported."
+            .. " Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema."
+            .. collection .. " WHERE \"QUERY\" = 'your search' LIMIT 10"
+    else
+        hint = "Semantic search requires: WHERE \"QUERY\" = 'your search text'."
+            .. " Example: SELECT \"ID\", \"TEXT\", \"SCORE\" FROM vector_schema."
+            .. collection .. " WHERE \"QUERY\" = 'your search' LIMIT 10"
+    end
+    hint = sql_escape(hint)
+    local query_hint = sql_escape(
+        "Only equality predicates on QUERY are supported: WHERE \"QUERY\" = 'your text'")
     return "SELECT * FROM VALUES"
         .. " (CAST('HINT' AS VARCHAR(2000000) UTF8),"
         .. " CAST('" .. hint .. "' AS VARCHAR(2000000) UTF8),"
@@ -226,38 +102,19 @@ function QueryRewriter:_build_empty_query_hint(collection)
         .. " AS t(ID, TEXT, SCORE, QUERY)"
 end
 
-local function sql_escape(s)
-    return (s or ""):gsub("'", "''")
-end
-
---- Builds the push-down SQL for non-empty results (VALUES clause).
--- For zero results, returns an empty-result query that preserves column types.
-function QueryRewriter:_build_sql(query_text, results)
-    if #results == 0 then
-        return "SELECT"
-            .. " CAST('' AS VARCHAR(36) UTF8) AS ID,"
-            .. " CAST('' AS VARCHAR(2000000) UTF8) AS TEXT,"
-            .. " CAST(0 AS DOUBLE) AS SCORE,"
-            .. " CAST('' AS VARCHAR(2000000) UTF8) AS QUERY"
-            .. " FROM DUAL WHERE FALSE"
-    end
-
-    local rows = {}
-    local q = sql_escape(query_text)
-    for _, r in ipairs(results) do
-        rows[#rows + 1] = string.format(
-            "(CAST('%s' AS VARCHAR(2000000) UTF8),"
-            .. "CAST('%s' AS VARCHAR(2000000) UTF8),"
-            .. "CAST(%s AS DOUBLE),"
-            .. "CAST('%s' AS VARCHAR(2000000) UTF8))",
-            sql_escape(r.id),
-            sql_escape(r.text),
-            tostring(r.score),
-            q
-        )
-    end
-
-    return "SELECT * FROM VALUES " .. table.concat(rows, ",") .. " AS t(ID, TEXT, SCORE, QUERY)"
+--- Generates the SET-UDF call wrapped to expose the (ID, TEXT, SCORE, QUERY)
+-- column projection the virtual schema declares.
+function QueryRewriter:_build_search_sql(collection, query_text, limit)
+    return string.format(
+        "SELECT result_id AS \"ID\", result_text AS \"TEXT\","
+        .. " result_score AS \"SCORE\", result_query AS \"QUERY\""
+        .. " FROM (SELECT ADAPTER.SEARCH_QDRANT_LOCAL("
+        .. "'%s', '%s', '%s', %d) FROM DUAL)",
+        sql_escape(self._connection_name),
+        sql_escape(collection),
+        sql_escape(query_text),
+        limit
+    )
 end
 
 return QueryRewriter

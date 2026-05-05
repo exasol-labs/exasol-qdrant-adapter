@@ -2,19 +2,20 @@
 
 Because Exasol virtual schemas are read-only, data cannot flow from Exasol into
 Qdrant through the virtual schema adapter. This guide shows how to use the
-**`EMBED_AND_PUSH_V2`** (recommended), **`EMBED_AND_PUSH`** (legacy), and
-**`CREATE_QDRANT_COLLECTION`** UDFs to ingest data that already lives in Exasol
-tables — the UDFs embed each row using Ollama and upsert the resulting vectors
-into Qdrant so you can later run semantic search via the virtual schema.
+**`EMBED_AND_PUSH_LOCAL`** SET UDF and the **`CREATE_QDRANT_COLLECTION`** scalar
+UDF to ingest data that already lives in Exasol tables. Both UDFs run inside
+the Exasol UDF VM. `EMBED_AND_PUSH_LOCAL` embeds each row in-process via
+`sentence-transformers` (loaded once per VM from BucketFS) and upserts the
+resulting vectors into Qdrant — no external embedding service is contacted.
 
 ## Overview
 
 ```
 Exasol table (native)
         │
-        │  SELECT EMBED_AND_PUSH(...)  ← SET UDF
+        │  SELECT EMBED_AND_PUSH_LOCAL(...)  ← SET UDF, in-process
         ▼
-Ollama (local embeddings — text → float vector)
+sentence-transformers + nomic-embed-text-v1.5 (BucketFS, loaded once per UDF VM)
         │
         ▼
 Qdrant collection (vector store)
@@ -28,61 +29,65 @@ Semantic search results back in Exasol SQL
 
 ## Prerequisites
 
-| Requirement | Notes |
-|---|---|
-| Exasol 7.x+ | Docker or on-premise |
-| Qdrant 1.9+ | `docker run -d --name qdrant -p 6333:6333 qdrant/qdrant` |
-| Ollama | `docker run -d --name ollama -p 11434:11434 ollama/ollama` |
-| `nomic-embed-text` pulled | `docker exec ollama ollama pull nomic-embed-text` |
+| Requirement                                | Notes                                                                                  |
+|--------------------------------------------|----------------------------------------------------------------------------------------|
+| Exasol 7.x+                                | Docker or on-premise                                                                   |
+| Qdrant 1.9+                                | `docker run -d --name qdrant -p 6333:6333 qdrant/qdrant`                               |
+| `qdrant-embed` SLC + model in BucketFS     | One-time: `./scripts/build_and_upload_slc.sh` — see [docs/local-embeddings.md](local-embeddings.md) |
+| `PYTHON3_QDRANT` script-language alias     | Created by `scripts/install_local_embeddings.sql` or `scripts/install_all.sql`         |
 
-> **No SLC or extra packages required.** The UDFs use Python's standard library only (`urllib`, `json`, `uuid`) and are deployed by running a single SQL file.
+> The model lives in BucketFS, the SLC ships `sentence-transformers`, and the
+> alias points at both. `EMBED_AND_PUSH_LOCAL`, `SEARCH_QDRANT_LOCAL` (the
+> query-path UDF the Lua adapter calls), and `EMBED_TEXT` (parity utility)
+> all share the same SLC + model copy — one model load per UDF VM.
 
 ---
 
 ## Docker Networking Note
 
-The UDFs run inside the Exasol container. Use the Docker bridge gateway IP (`172.17.0.1`) for **all** services — not `localhost`, and not individual container IPs.
+The UDFs run inside the Exasol container. Use the Docker bridge gateway IP (`172.17.0.1`) for Qdrant — not `localhost`, and not the Qdrant container IP.
 
 ```bash
 # Find the gateway IP
 docker exec exasoldb ip route show default
 # → default via 172.17.0.1 dev eth0
-# Use 172.17.0.1 for BOTH qdrant_url and ollama_url
+# Use 172.17.0.1 for qdrant_url
 ```
-
-You do NOT need individual container IPs. The bridge gateway IP works for everything because Docker forwards traffic to the correct containers via published ports.
 
 ---
 
 ## Step 1 — Deploy the UDF Scripts
 
-If you used `scripts/install_all.sql` (the one-file installer), the UDFs are already deployed — skip to Step 2.
+If you used `scripts/install_all.sql` (the one-file installer), the UDFs are
+already deployed — skip to Step 2.
 
-Otherwise, run `scripts/create_udfs_ollama.sql` directly in your SQL client (DBeaver, DbVisualizer, etc.). No SLC build or BucketFS upload is needed.
+If you only need the local-embeddings UDFs, run
+`scripts/install_local_embeddings.sql` instead. It registers the
+`PYTHON3_QDRANT` alias and creates `EMBED_AND_PUSH_LOCAL`, `EMBED_TEXT`, and
+`SEARCH_QDRANT_LOCAL` (the query-path UDF the Lua adapter depends on).
 
 ```sql
 -- Prerequisites
 CREATE SCHEMA IF NOT EXISTS ADAPTER;
 ```
 
-Then open and run the full contents of `scripts/create_udfs_ollama.sql`. This creates two scripts in the `ADAPTER` schema:
-- `ADAPTER.CREATE_QDRANT_COLLECTION`
-- `ADAPTER.EMBED_AND_PUSH`
+Then open and run the full contents of `scripts/install_all.sql` (or the
+narrower `scripts/install_local_embeddings.sql`).
 
 ---
 
 ## Step 2 — Create a Qdrant Collection
 
 ```sql
--- nomic-embed-text produces 768-dimensional vectors
+-- nomic-embed-text-v1.5 produces 768-dimensional vectors
 SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
-    '172.17.0.1',   -- qdrant_host (gateway IP reachable from inside Exasol)
-    6333,           -- qdrant_port
-    '',             -- api_key (empty = no authentication)
-    'my_articles',  -- collection name
-    768,            -- vector_size (must match embedding model output)
-    'Cosine',       -- distance metric
-    ''              -- model_name (leave empty when vector_size is explicit)
+    '172.17.0.1',          -- qdrant_host (gateway IP reachable from inside Exasol)
+    6333,                  -- qdrant_port
+    '',                    -- api_key (empty = no authentication)
+    'my_articles',         -- collection name
+    768,                   -- vector_size (must match embedding model output)
+    'Cosine',              -- distance metric
+    ''                     -- model_name (leave empty when vector_size is explicit)
 );
 -- Returns: 'created: my_articles'
 -- Returns: 'exists: my_articles'  if it already exists
@@ -102,7 +107,7 @@ Supported distance metrics: `Cosine`, `Dot`, `Euclid`, `Manhattan`.
 | 2 | `port` | Qdrant REST port (default `6333`) |
 | 3 | `api_key` | API key, or `''` for unauthenticated |
 | 4 | `collection` | Collection name to create or verify |
-| 5 | `vector_size` | Vector dimension. `768` for `nomic-embed-text`, `1536` for OpenAI `text-embedding-3-small`. Pass `NULL` to infer from `model_name` |
+| 5 | `vector_size` | Vector dimension. `768` for `nomic-embed-text-v1.5`. Pass `NULL` to infer from `model_name` |
 | 6 | `distance` | Similarity metric: `Cosine`, `Dot`, `Euclid`, or `Manhattan` |
 | 7 | `model_name` | Used for automatic size inference when `vector_size` is `NULL`. Leave `''` when providing explicit size |
 
@@ -110,23 +115,21 @@ Supported distance metrics: `Cosine`, `Dot`, `Euclid`, `Manhattan`.
 
 ## Step 3 — Ingest Data from an Exasol Table
 
-Only two columns are needed: an ID column and a text column. All other columns are ignored during ingestion.
+Only two columns are needed: an ID column and a text column. All other columns
+are ignored during ingestion.
 
-### EMBED_AND_PUSH_V2 (recommended — CONNECTION-based)
-
-Simplified 4-parameter UDF that reads infrastructure config from a CONNECTION object. Credentials never appear in SQL text or audit logs.
+`EMBED_AND_PUSH_LOCAL` reads infrastructure config from a CONNECTION object —
+credentials never appear in SQL text or audit logs.
 
 ```sql
 -- The embedding_conn CONNECTION is created by install_all.sql.
 -- If you need a custom one:
 CREATE OR REPLACE CONNECTION my_embedding_conn TO '{
     "qdrant_url": "http://172.17.0.1:6333",
-    "ollama_url": "http://172.17.0.1:11434",
-    "provider": "ollama",
-    "model": "nomic-embed-text"
+    "qdrant_api_key": ""
 }';
 
-SELECT ADAPTER.EMBED_AND_PUSH_V2(
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
     'embedding_conn',                   -- connection name
     'my_articles',                      -- Qdrant collection
     CAST("id" AS VARCHAR(255)),         -- unique ID
@@ -136,86 +139,33 @@ FROM MY_SCHEMA.MY_TABLE
 GROUP BY IPROC();
 ```
 
-`GROUP BY IPROC()` distributes the work across Exasol cluster nodes. The UDF returns one summary row per node: `(partition_id, upserted_count)`.
+`GROUP BY IPROC()` distributes the work across Exasol cluster nodes. The UDF
+returns one summary row per partition: `(partition_id, upserted_count)`.
 
-> **Timing:** Embedding speed depends on dataset size and model. Expect ~1–2 rows/second
-> with Ollama on CPU. For 544 rows, expect 30–60 seconds. The query will appear to "hang"
+> **Timing:** First call after a UDF VM start pays a 3–8 s model-load cost.
+> Steady-state throughput on a single node is ~8.7 rows/sec for ~280-character
+> text. For 544 rows expect ~60–90 s. The query will appear to "hang"
 > until all embeddings are computed — this is normal.
 
-### EMBED_AND_PUSH_V2 parameters
+### EMBED_AND_PUSH_LOCAL parameters
 
-| # | Parameter | Description |
-|---|---|---|
-| 1 | `connection_name` | Name of an Exasol CONNECTION object containing config JSON |
-| 2 | `collection` | Target Qdrant collection name |
-| 3 | `id` | Source row identifier — stored as Qdrant payload field `_original_id` |
-| 4 | `text` | Text to embed — stored as payload field `text` |
+| # | Parameter         | Description                                                                  |
+|---|-------------------|------------------------------------------------------------------------------|
+| 1 | `connection_name` | Name of an Exasol CONNECTION object containing config JSON                   |
+| 2 | `collection`      | Target Qdrant collection name                                                |
+| 3 | `id`              | Source row identifier — stored as Qdrant payload field `_original_id`        |
+| 4 | `text_col`        | Text to embed — stored as payload field `text`. Truncated at 6000 characters |
 
 ### CONNECTION config JSON fields
 
-| Key | Required | Default | Description |
-|-----|----------|---------|-------------|
-| `qdrant_url` | Yes | -- | Full Qdrant URL (e.g. `http://172.17.0.1:6333`) |
-| `ollama_url` | Yes (for Ollama) | -- | Full Ollama URL (e.g. `http://172.17.0.1:11434`) |
-| `provider` | Yes | -- | `ollama` or `openai` |
-| `model` | Yes | -- | Embedding model name |
-| `batch_size` | No | `100` | Number of texts to embed per API call. Lower for large texts, higher for throughput. |
-| `max_chars` | No | `6000` | Max characters per text before truncation (~1500 tokens for nomic-embed-text). |
+| Key              | Required | Default | Description                                                |
+|------------------|----------|---------|------------------------------------------------------------|
+| `qdrant_url`     | Yes      | --      | Full Qdrant URL (e.g. `http://172.17.0.1:6333`)            |
+| `qdrant_api_key` | No       | `""`    | Qdrant API key (also reads from CONNECTION password field) |
 
-Example CONNECTION with tuning:
-
-```sql
-CREATE OR REPLACE CONNECTION embedding_conn
-    TO '{"qdrant_url":"http://172.17.0.1:6333","ollama_url":"http://172.17.0.1:11434","provider":"ollama","model":"nomic-embed-text","batch_size":50,"max_chars":4000}'
-    USER '' IDENTIFIED BY '';
-```
-
----
-
-### EMBED_AND_PUSH (legacy — 9 positional parameters)
-
-> **Security Warning:** This UDF passes API keys as plain-text SQL parameters. These values
-> appear **verbatim** in Exasol's audit log (`EXA_DBA_AUDIT_SQL`). Anyone with SELECT access
-> to audit tables can harvest your credentials. **Always prefer `EMBED_AND_PUSH_V2` above.**
-
-The original UDF is still available for backward compatibility:
-
-```sql
-SELECT ADAPTER.EMBED_AND_PUSH(
-    "new_id",                    -- id column
-    "text",                      -- text column to embed
-    '172.17.0.1',                -- qdrant_host
-    6333,                        -- qdrant_port
-    '',                          -- qdrant_api_key
-    'my_articles',               -- collection name
-    'ollama',                    -- provider ('ollama' or 'openai')
-    'http://172.17.0.1:11434',   -- embedding_key = Ollama base URL when provider='ollama'
-    'nomic-embed-text'           -- model name
-)
-FROM MY_SCHEMA.MY_TABLE
-GROUP BY IPROC();
-```
-
-### EMBED_AND_PUSH parameters
-
-| # | Parameter | Description |
-|---|---|---|
-| 1 | `id` | Source row identifier — stored as Qdrant payload field `_original_id` |
-| 2 | `text_col` | Text to embed — stored as payload field `text`. Texts longer than 6000 characters are automatically truncated |
-| 3 | `qdrant_host` | Qdrant host IP |
-| 4 | `qdrant_port` | Qdrant REST port |
-| 5 | `qdrant_api_key` | Qdrant API key, or `''` |
-| 6 | `collection` | Target collection name |
-| 7 | `provider` | `'ollama'` for local Ollama embeddings, `'openai'` for OpenAI API |
-| 8 | `embedding_key` | **Ollama**: full base URL (e.g. `'http://172.17.0.1:11434'`). **OpenAI**: API key (`'sk-...'`) |
-| 9 | `model_name` | Embedding model (e.g. `'nomic-embed-text'`, `'text-embedding-3-small'`) |
-
-### Provider behaviour
-
-| Provider | `embedding_key` value | Notes |
-|---|---|---|
-| `'ollama'` | Ollama base URL, e.g. `'http://172.17.0.1:11434'` | Use the Docker bridge gateway IP — not `localhost` |
-| `'openai'` | OpenAI API key `'sk-...'` | Requires internet access from Exasol |
+The model name and dimensions are fixed by the SLC + BucketFS upload — there
+are no model/provider options on the ingest side. To change the embedding
+model, rebuild the SLC against a different model.
 
 ---
 
@@ -230,31 +180,34 @@ WHERE "QUERY" = 'trade tensions between US and Japan'
 LIMIT 10;
 ```
 
-> **Tip:** Semantic search finds documents with similar *meaning*, not keyword matches. Use descriptive phrases rather than single words for best results.
+> **Tip:** Semantic search finds documents with similar *meaning*, not keyword
+> matches. Use descriptive phrases rather than single words for best results.
+
+The query path also runs in-process — the Lua adapter generates pushdown SQL
+that calls `ADAPTER.SEARCH_QDRANT_LOCAL`, which embeds the query text and
+runs Qdrant hybrid search inside the same UDF.
 
 ---
 
 ## Troubleshooting
 
-| Error | Cause | Fix |
-|---|---|---|
-| `function or script ADAPTER.EMBED_AND_PUSH not found` | UDF scripts not created | Run `scripts/create_udfs_ollama.sql` in your SQL client |
-| `Connection refused` (Ollama) | Wrong IP for Ollama | Use the container IP from `docker inspect ollama`, not `localhost` |
-| `the input length exceeds the context length` | Text too long for model | Fixed automatically — texts are truncated at 6000 characters |
-| `invalid input type` | NULL values in text column | Fixed automatically — NULLs are replaced with empty strings |
-| `Not existing vector name error: text` | Collection created with unnamed vectors | Delete and recreate collection, then re-ingest |
-| `Qdrant HTTP 400` during upsert | Vector dimension mismatch | Ensure `vector_size` in `CREATE_QDRANT_COLLECTION` matches the model output |
-| Zero search results | Query text not semantically matching content | Use a more descriptive query phrase |
-| NULL IDs in search results | Old data ingested before payload fix | Delete collection, re-run UDF script, re-ingest |
+| Error                                                       | Cause                                                       | Fix                                                                                                |
+|-------------------------------------------------------------|-------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| `function or script ADAPTER.EMBED_AND_PUSH_LOCAL not found` | UDF scripts not created                                     | Run `scripts/install_local_embeddings.sql` (or `scripts/install_all.sql`) in your SQL client       |
+| `language not found: PYTHON3_QDRANT`                        | `SCRIPT_LANGUAGES` not extended                             | Re-run the `ALTER SYSTEM SET SCRIPT_LANGUAGES = ...` block in `install_local_embeddings.sql`       |
+| `ModuleNotFoundError: sentence_transformers`                | SLC not in BucketFS, or alias path mismatch                 | Re-run `./scripts/build_and_upload_slc.sh`                                                         |
+| `Connection refused` (Qdrant)                               | Wrong IP / port for Qdrant                                  | Use the Docker bridge gateway IP (`172.17.0.1`), not `localhost`                                   |
+| Long text truncation                                        | Text > 6000 chars                                           | Automatic — UDF truncates at `MAX_CHARS`. Check the SLC source if a different cap is needed.       |
+| `Qdrant HTTP 400` during upsert                             | Vector dimension mismatch                                   | Ensure `vector_size=768` in `CREATE_QDRANT_COLLECTION` (matches `nomic-embed-text-v1.5` output)    |
+| Zero search results                                         | Query text not semantically matching content                | Use a more descriptive query phrase                                                                |
+| `function or script ADAPTER.SEARCH_QDRANT_LOCAL not found`  | Query-path UDF missing                                      | Re-run `scripts/install_all.sql` or `scripts/install_local_embeddings.sql`                         |
+| OOM on Exasol nodes                                         | Too many concurrent UDF VMs for node memory                 | Drop concurrency (lower partition cardinality) or add RAM. Each VM holds ~600 MB resident.         |
 
 ---
 
 ## Security Note — Secrets in SQL
 
-**Use `EMBED_AND_PUSH_V2`** (CONNECTION-based) to keep credentials out of SQL text. Exasol redacts CONNECTION contents as `<SECRET>` in audit logs.
-
-The legacy `EMBED_AND_PUSH` passes API keys as SQL string literals, which means they appear in:
-- Exasol audit logs (`EXA_DBA_AUDIT_SQL`)
-- SQL client history files
-
-**Mitigations for legacy UDF:** restrict access to audit log views with `GRANT`/`REVOKE`, and rotate credentials regularly.
+Use the CONNECTION-based pattern shown above to keep credentials out of SQL
+text. Exasol redacts CONNECTION contents as `<SECRET>` in audit logs.
+`EMBED_AND_PUSH_LOCAL` only ever reads the CONNECTION's JSON address and
+optional password field — no API keys appear as SQL parameters.

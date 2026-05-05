@@ -24,19 +24,7 @@ Run each command in your terminal. Wait for each one to finish before running th
 docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
 ```
 
-**2. Start Ollama (the embedding model server)**
-
-```bash
-docker run -d --name ollama -p 11434:11434 ollama/ollama
-```
-
-**3. Download the embedding model into Ollama** (takes a minute or two)
-
-```bash
-docker exec ollama ollama pull nomic-embed-text
-```
-
-**4. Start Exasol**
+**2. Start Exasol**
 
 ```bash
 docker run -d --name exasoldb \
@@ -49,6 +37,16 @@ docker run -d --name exasoldb \
 > Exasol can take 1–2 minutes to fully start up. You can check it is ready by trying to connect:
 > `docker exec exasoldb /bin/bash -c 'exaplus -c localhost:8563 -u sys -p exasol -sql "SELECT 1;"' 2>&1 | tail -5`
 > If this returns `1`, Exasol is ready. If it fails, wait another minute and retry.
+
+**3. Build and upload the embedding SLC + model into BucketFS** (one-time, ~30 minutes the first run)
+
+```bash
+./scripts/build_and_upload_slc.sh
+```
+
+This builds the `qdrant-embed` script-language container (SLC) — a custom Python image that ships `sentence-transformers` — and uploads both the SLC and the `nomic-embed-text-v1.5` model to Exasol's BucketFS. You only run this once per cluster. See [`docs/local-embeddings.md`](local-embeddings.md) for build prerequisites (a Linux Docker host with ~20 GB free disk).
+
+> **No separate embedding service.** All embeddings happen inside Exasol's UDF VMs against the BucketFS-resident model — no Ollama, no OpenAI, no HTTP hop.
 
 ---
 
@@ -65,7 +63,7 @@ docker exec exasoldb ip route show default
 # Example output: default via 172.17.0.1 dev eth0
 ```
 
-The IP after `via` (e.g., `172.17.0.1`) is your **Docker bridge IP**. Write it down — you'll use it for **everything**: Qdrant, Ollama, the virtual schema, and the ingestion UDFs. You do NOT need individual container IPs.
+The IP after `via` (e.g., `172.17.0.1`) is your **Docker bridge IP**. Write it down — you'll use it for the Qdrant URL in both the virtual schema and the ingestion UDF. You do NOT need individual container IPs.
 
 ---
 
@@ -90,9 +88,10 @@ Open the file [`scripts/install_all.sql`](../scripts/install_all.sql) from this 
 
 This single file deploys everything:
 
-- Schema and connection to Qdrant
+- Schema and CONNECTION objects (`qdrant_conn`, `embedding_conn`)
+- `PYTHON3_QDRANT` script-language alias (points at the SLC you uploaded in Step 1)
 - Lua adapter script (the virtual schema engine)
-- Python UDFs for data ingestion (`CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH_V2`, `EMBED_AND_PUSH`)
+- Python UDFs: `CREATE_QDRANT_COLLECTION`, `EMBED_AND_PUSH_LOCAL` (ingest), `EMBED_TEXT` (query-time embedding)
 - Preflight health check UDF (`PREFLIGHT_CHECK`)
 - Virtual schema ready for queries
 
@@ -114,13 +113,12 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 
 ### 4b. Load the sample knowledge base
 
-This embeds 12 realistic support articles across 4 topic clusters and stores them in Qdrant. The `embedding_conn` CONNECTION was already created by `install_all.sql` — it contains the Qdrant URL, Ollama URL, provider, and model config so you only need 4 parameters.
+This embeds 12 realistic support articles across 4 topic clusters and stores them in Qdrant. The `embedding_conn` CONNECTION was already created by `install_all.sql` — it points at your Qdrant URL. Embeddings are computed in-process by the SLC + model you uploaded in Step 1; no external embedding service is contacted.
 
-> **Timing:** Embedding 12 documents takes about 10–15 seconds. The query will
-> appear to "hang" until all embeddings are computed and uploaded — this is normal.
+> **Timing:** The first call after a UDF VM start pays a 3–8 s model-load cost from BucketFS. Embedding 12 documents in a warm VM takes a couple of seconds. The query will appear to "hang" until all embeddings are computed and uploaded — this is normal.
 
 ```sql
-SELECT ADAPTER.EMBED_AND_PUSH_V2(
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
     'embedding_conn',
     'support_kb',
     id_col,
@@ -162,7 +160,7 @@ ALTER VIRTUAL SCHEMA vector_schema REFRESH;
 
 Now run some searches and see how semantic understanding works in practice.
 
-> **Note on scores:** Your exact similarity scores will differ from the examples below — they vary by Ollama version, model version, and system architecture. What matters is the **ranking order** and that the correct **topic cluster** appears at the top.
+> **Note on scores:** Your exact similarity scores will differ from the examples below — they vary by model revision and system architecture. What matters is the **ranking order** and that the correct **topic cluster** appears at the top.
 
 ### Query 1 — Direct match
 
@@ -272,19 +270,16 @@ SELECT ADAPTER.CREATE_QDRANT_COLLECTION(
 The UDF takes two columns from your table:
 
 - **`YOUR_ID_COLUMN`** -- A unique identifier for each row (e.g. a primary key or row number). This is stored as `_original_id` in Qdrant and returned as the `"ID"` column in search results, so you can join back to your source table.
-- **`YOUR_TEXT_COLUMN`** -- The text to embed and search against. This is the content that gets converted into a vector by Ollama. For best results, concatenate multiple columns into a descriptive sentence rather than using a single field (see example below).
+- **`YOUR_TEXT_COLUMN`** -- The text to embed and search against. This is the content that gets converted into a vector inside the UDF VM via `sentence-transformers`. For best results, concatenate multiple columns into a descriptive sentence rather than using a single field (see example below).
 
 Both must be `VARCHAR` -- cast numeric or date columns with `CAST(... AS VARCHAR(...))`.
 
 ```sql
-SELECT ADAPTER.EMBED_AND_PUSH(
-    CAST(YOUR_ID_COLUMN AS VARCHAR(36)),
-    YOUR_TEXT_COLUMN,                    -- or a concatenation (see below)
-    '<DOCKER_BRIDGE_IP>', 6333, '',
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
+    'embedding_conn',
     'YOUR_COLLECTION',
-    'ollama',
-    'http://<OLLAMA_IP>:11434',
-    'nomic-embed-text'
+    CAST(YOUR_ID_COLUMN AS VARCHAR(36)),
+    YOUR_TEXT_COLUMN                     -- or a concatenation (see below)
 )
 FROM YOUR_SCHEMA.YOUR_TABLE
 GROUP BY IPROC();
@@ -293,14 +288,11 @@ GROUP BY IPROC();
 **Concatenation example:** If your table has `name`, `city`, and `date` columns, combine them into a richer text for better search quality:
 
 ```sql
-SELECT ADAPTER.EMBED_AND_PUSH(
-    CAST("id" AS VARCHAR(36)),
-    "name" || ' in ' || "city" || '. Date: ' || CAST("date" AS VARCHAR(10)),
-    '<DOCKER_BRIDGE_IP>', 6333, '',
+SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
+    'embedding_conn',
     'events',
-    'ollama',
-    'http://<OLLAMA_IP>:11434',
-    'nomic-embed-text'
+    CAST("id" AS VARCHAR(36)),
+    "name" || ' in ' || "city" || '. Date: ' || CAST("date" AS VARCHAR(10))
 )
 FROM MY_SCHEMA.EVENTS
 GROUP BY IPROC();

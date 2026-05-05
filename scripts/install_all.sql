@@ -3,46 +3,61 @@
 -- =============================================================================
 --
 -- This single file deploys the complete semantic search stack:
---   1. Schema for adapter scripts and UDFs
---   2. Connection to Qdrant
---   3. Lua adapter script (virtual schema engine)
---   4. Python UDFs (collection creation + data ingestion)
---   5. Virtual schema (query interface)
+--   1. ADAPTER schema for adapter scripts and UDFs
+--   2. CONNECTION objects for Qdrant (used by both the Lua adapter and the
+--      ingest/search UDFs)
+--   3. PYTHON3_QDRANT script-language alias for the qdrant-embed SLC
+--   4. Lua adapter script (virtual schema engine; rewrites pushdown to a
+--      call to ADAPTER.SEARCH_QDRANT_LOCAL)
+--   5. Python UDFs:
+--        - CREATE_QDRANT_COLLECTION (scalar)
+--        - EMBED_AND_PUSH_LOCAL     (set, in-process via SLC — ingest path)
+--        - EMBED_TEXT               (scalar, in-process via SLC — utility)
+--        - SEARCH_QDRANT_LOCAL      (set, in-process via SLC — query path)
+--        - PREFLIGHT_CHECK          (scalar)
+--   6. Virtual schema (no OLLAMA_URL property — query embeddings happen
+--      in-database via ADAPTER.SEARCH_QDRANT_LOCAL)
 --
 -- INSTRUCTIONS:
---   1. Update the 5 values in the CONFIGURATION section below
---   2. Run this entire file in your SQL client (DBeaver, DbVisualizer, etc.)
---   3. Done! Skip to the USAGE EXAMPLES at the bottom.
+--   1. Update the IP/port/connection values below for your environment
+--   2. Make sure the qdrant-embed SLC and nomic-embed-text-v1.5 model are
+--      already in BucketFS (run scripts/build_and_upload_slc.sh once if not)
+--   3. Run this entire file in your SQL client (DBeaver, DbVisualizer, etc.)
+--   4. Re-running this script is safe — every statement is idempotent
+--      (CREATE OR REPLACE / IF NOT EXISTS / DROP FORCE IF EXISTS)
 --
 -- Prerequisites:
 --   - Exasol 7.x+ running (Docker: docker run -d --name exasoldb -p 8563:8563 --privileged exasol/docker-db:latest)
---     Wait ~90 seconds for initialization. Connect: host=localhost, port=8563, user=sys, password=exasol
+--     Wait ~90 seconds for initialisation. Connect: host=localhost, port=8563, user=sys, password=exasol
 --   - Qdrant 1.9+ accessible from inside Exasol (Docker: docker run -d --name qdrant -p 6333:6333 qdrant/qdrant)
---   - Ollama with an embedding model pulled (Docker: docker run -d --name ollama -p 11434:11434 ollama/ollama
---     then: docker exec ollama ollama pull nomic-embed-text)
+--   - qdrant-embed SLC + nomic-embed-text-v1.5 model in BucketFS
+--     (run ./scripts/build_and_upload_slc.sh once)
+--
+--   No Ollama required. The query path embeds and searches in-database via
+--   the ADAPTER.SEARCH_QDRANT_LOCAL set UDF, sharing the same SLC + model
+--   as the ingest path.
 --
 -- Docker networking note:
 --   Inside Exasol's container, use the Docker bridge gateway IP (typically
 --   172.17.0.1) to reach services on the host. Find it with:
 --     docker exec exasoldb ip route show default
 --   host.docker.internal does NOT work in Exasol's UDF sandbox on Linux.
+--
+-- Migrating from earlier versions:
+--   If you previously deployed this adapter with OLLAMA_URL or used
+--   ADAPTER.EMBED_AND_PUSH / EMBED_AND_PUSH_V2:
+--     1. DROP FORCE VIRTUAL SCHEMA IF EXISTS vector_schema;
+--     2. Re-run this file (it removes the old UDFs and replaces the adapter)
+--     3. Re-ingest into a fresh Qdrant collection via EMBED_AND_PUSH_LOCAL
+--        (the on-disk vectors from Ollama-backed ingest are not interchangeable
+--        with SLC-backed vectors in a single collection — see
+--        docs/local-embeddings.md for the parity hazard details)
+--     4. Stop and remove the Ollama container: docker rm -f ollama
 -- =============================================================================
 
 
 -- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ CONFIGURATION — Update these values for your environment                 │
--- └───────────────────────────────────────────────────────────────────────────┘
--- To customize, find-and-replace these defaults throughout the file:
---
---   ADAPTER          → Schema name for scripts/UDFs
---   172.17.0.1       → Your Qdrant/Ollama host IP
---   6333             → Your Qdrant port
---   11434            → Your Ollama port
---   nomic-embed-text → Your Ollama embedding model
-
-
--- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ STEP 1: Create schema                                                    │
+-- │ STEP 1: Create schema                                                     │
 -- └───────────────────────────────────────────────────────────────────────────┘
 
 CREATE SCHEMA IF NOT EXISTS ADAPTER;
@@ -50,31 +65,64 @@ OPEN SCHEMA ADAPTER;
 
 
 -- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ STEP 2: Create connection to Qdrant                                      │
+-- │ STEP 2: Create connection objects                                         │
 -- └───────────────────────────────────────────────────────────────────────────┘
--- The CONNECTION stores the Qdrant URL and optional API key.
--- USER is unused. IDENTIFIED BY is the Qdrant API key (leave '' for no auth).
+-- qdrant_conn — used by the Lua adapter (virtual schema). The address is the
+-- raw Qdrant base URL; password is the Qdrant API key (or '' for no auth).
 
 CREATE OR REPLACE CONNECTION qdrant_conn
     TO 'http://172.17.0.1:6333'
     USER ''
     IDENTIFIED BY '';
 
+-- embedding_conn — used by EMBED_AND_PUSH_LOCAL. The address is a JSON config
+-- blob that holds the Qdrant URL (and optionally the API key). The password
+-- field is redacted as <SECRET> in audit logs, so prefer it for API keys.
+
+CREATE OR REPLACE CONNECTION embedding_conn
+    TO '{"qdrant_url":"http://172.17.0.1:6333"}'
+    USER ''
+    IDENTIFIED BY '';
+
 
 -- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ STEP 3: Deploy Lua adapter script                                        │
+-- │ STEP 3: Register the PYTHON3_QDRANT script-language alias                 │
 -- └───────────────────────────────────────────────────────────────────────────┘
--- This is the virtual schema engine. It handles:
---   - Discovering Qdrant collections as virtual tables
---   - Embedding query text via Ollama at query time
---   - Searching Qdrant for similar vectors
---   - Returning ranked results as SQL rows
+-- Points at the qdrant-embed SLC in BucketFS. EMBED_AND_PUSH_LOCAL and
+-- EMBED_TEXT both run under this alias and share one in-VM model load.
 --
--- Fixed 4-column schema per table: ID, TEXT, SCORE, QUERY
+-- ALTER SYSTEM SET SCRIPT_LANGUAGES is REPLACING (not appending). If your
+-- cluster already has other custom aliases, edit this string to include them.
+-- The default Exasol aliases (PYTHON3, R, JAVA) are kept first to preserve
+-- baseline behaviour.
+
+ALTER SYSTEM SET SCRIPT_LANGUAGES =
+    'PYTHON3=builtin_python3 R=builtin_r JAVA=builtin_java '
+    'PYTHON3_QDRANT=localzmq+protobuf:///bfsdefault/default/slc/qdrant-embed'
+    '?lang=python#buckets/bfsdefault/default/slc/qdrant-embed/exaudf/exaudfclient';
+
+
+-- ┌───────────────────────────────────────────────────────────────────────────┐
+-- │ STEP 4: Deploy Lua adapter script                                         │
+-- └───────────────────────────────────────────────────────────────────────────┘
+-- The virtual schema engine. It:
+--   - Discovers Qdrant collections as virtual tables (HTTP GET /collections)
+--   - Rewrites pushdown queries to a SQL call to ADAPTER.SEARCH_QDRANT_LOCAL,
+--     which owns the embed + Qdrant search work.
+--
+-- Why a SET UDF and not pquery directly:
+--   Exasol forbids exa.pquery_no_preprocessing during virtual schema pushdown
+--   (it would re-enter the SQL planner and create cycles). The canonical
+--   workaround is a row-emitting UDF that the adapter targets via generated
+--   SQL — that's ADAPTER.SEARCH_QDRANT_LOCAL.
+--
+-- Fixed 4-column schema per virtual table: ID, TEXT, SCORE, QUERY
+-- Properties: CONNECTION_NAME (required), QDRANT_MODEL (required),
+--             QDRANT_URL (optional override), COLLECTION_FILTER (optional).
+--             OLLAMA_URL is rejected — it is no longer a valid property.
 
 CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
--- Adapter version: update this on each release for deployment tracking.
-local ADAPTER_VERSION = "2.2.0"
+local ADAPTER_VERSION = "3.1.0"
 
 local cjson = require("cjson")
 local http  = require("socket.http")
@@ -86,29 +134,6 @@ local function http_get_json(url, headers)
     local body = table.concat(chunks)
     assert(type(code)=="number" and code<400, ("GET %s => %s: %s"):format(url,tostring(code),body))
     return cjson.decode(body)
-end
-
-local function http_post_json(url, payload, headers)
-    local body = cjson.encode(payload)
-    local h = headers or {}
-    h["Content-Type"]="application/json"
-    h["Content-Length"]=tostring(#body)
-    local chunks = {}
-    local _, code = http.request({url=url, method="POST", headers=h, source=ltn12.source.string(body), sink=ltn12.sink.table(chunks)})
-    local resp = table.concat(chunks)
-    assert(type(code)=="number" and code<400, ("POST %s => %s: %s"):format(url,tostring(code),resp))
-    return cjson.decode(resp)
-end
-
-local function http_post_raw(url, body, headers)
-    local h = headers or {}
-    h["Content-Type"]="application/json"
-    h["Content-Length"]=tostring(#body)
-    local chunks = {}
-    local _, code = http.request({url=url, method="POST", headers=h, source=ltn12.source.string(body), sink=ltn12.sink.table(chunks)})
-    local resp = table.concat(chunks)
-    assert(type(code)=="number" and code<400, ("POST %s => %s: %s"):format(url,tostring(code),resp))
-    return cjson.decode(resp)
 end
 
 local COLS = {
@@ -156,54 +181,7 @@ end
 
 local function esc(s) return (s or ""):gsub("'", "''") end
 
--- Tokenizer for hybrid search keyword extraction
-local _STOP = {}
-for _, w in ipairs({
-    "a","an","the","and","or","but","not","no","nor","so","yet",
-    "is","am","are","was","were","be","been","being",
-    "has","have","had","do","does","did","will","would","shall","should",
-    "can","could","may","might","must",
-    "in","on","at","to","for","of","by","from","with","about","between",
-    "through","during","before","after","above","below","up","down",
-    "out","off","over","under","into",
-    "i","me","my","we","us","our","you","your","he","him","his",
-    "she","her","it","its","they","them","their",
-    "this","that","these","those","what","which","who","whom","how",
-    "when","where","why","if","then","than","as","while",
-    "all","each","every","both","few","more","most","some","any","such",
-    "very","just","also","only","too","own","same","other",
-}) do _STOP[w] = true end
-
-local function extract_keywords(text)
-    local seen, result, prev = {}, {}, nil
-    for word in text:lower():gmatch("[%w]+") do
-        if #word >= 2 and not _STOP[word] and not seen[word] then
-            seen[word] = true
-            result[#result+1] = word
-            if prev then
-                local compound = prev .. word
-                if not seen[compound] then
-                    seen[compound] = true
-                    result[#result+1] = compound
-                end
-            end
-            prev = word
-        else
-            prev = nil
-        end
-    end
-    if #result > 12 then
-        local capped = {}
-        for i = 1, 12 do capped[i] = result[i] end
-        return capped
-    end
-    return result
-end
-
 local function rewrite(req, props)
-    local url, key = resolve(props)
-    assert(props.OLLAMA_URL and props.OLLAMA_URL ~= "", "OLLAMA_URL property is not set. Set it to your Ollama endpoint reachable from inside Exasol (e.g. 'http://172.17.0.1:11434' for Docker bridge). Do NOT use 'localhost' — it does not work inside Exasol's UDF sandbox.")
-    local ollama = props.OLLAMA_URL
     local pdr = req.pushdownRequest or {}
     local col = (((req.involvedTables or {})[1]) or {}).name
     assert(col, "no involved table in involvedTables")
@@ -233,58 +211,25 @@ local function rewrite(req, props)
         return "SELECT * FROM VALUES (CAST('HINT' AS VARCHAR(2000000) UTF8), CAST('" .. hint_text .. "' AS VARCHAR(2000000) UTF8), CAST(1 AS DOUBLE), CAST('Only equality predicates on QUERY are supported: WHERE \"QUERY\" = ''your text''' AS VARCHAR(2000000) UTF8)) AS t(ID, TEXT, SCORE, QUERY)"
     end
     local limit = (pdr.limit and pdr.limit.numElements) and tonumber(pdr.limit.numElements) or 10
-    local emb = http_post_json(ollama .. "/api/embeddings", {model=props.QDRANT_MODEL, prompt=qtext})
-    assert(emb.embedding, "Ollama returned no embedding array")
-    local keys = {}
-    for k, _ in pairs(emb.embedding) do if type(k) == "number" then keys[#keys+1] = k end end
-    table.sort(keys)
-    local parts = {}
-    for _, k in ipairs(keys) do parts[#parts+1] = tostring(emb.embedding[k]) end
-    assert(#parts > 0, "Ollama embedding array is empty after iteration")
-    local emb_json = "[" .. table.concat(parts, ",") .. "]"
-    -- Hybrid search: vector + per-keyword RRF fusion
-    local keywords = extract_keywords(qtext)
-    local search_body
-    if #keywords > 0 then
-        local vlimit = math.max(limit * 10, 50)
-        local klimit = math.max(limit * 4, 20)
-        local legs = {string.format('{"query":%s,"using":"text","limit":%d}', emb_json, vlimit)}
-        for _, kw in ipairs(keywords) do
-            legs[#legs+1] = string.format('{"query":%s,"using":"text","limit":%d,"filter":{"must":[{"key":"text","match":{"text":"%s"}}]}}', emb_json, klimit, kw:gsub('"', '\\"'))
-        end
-        search_body = string.format('{"prefetch":[%s],"query":{"fusion":"rrf"},"limit":%d,"with_payload":true}', table.concat(legs, ","), limit)
-    else
-        search_body = string.format(
-            '{"query":%s,"using":"text","limit":%d,"with_payload":true}',
-            emb_json, limit
-        )
-    end
-    local h2 = {}
-    if key ~= "" then h2["api-key"] = key end
-    local sr = http_post_raw(
-        url .. "/collections/" .. col .. "/points/query",
-        search_body,
-        h2
+    return string.format(
+        "SELECT result_id AS \"ID\", result_text AS \"TEXT\","
+        .. " result_score AS \"SCORE\", result_query AS \"QUERY\""
+        .. " FROM (SELECT ADAPTER.SEARCH_QDRANT_LOCAL("
+        .. "'%s', '%s', '%s', %d) FROM DUAL)",
+        esc(props.CONNECTION_NAME), esc(col), esc(qtext), limit
     )
-    local res = (sr.result or {}).points or {}
-    if #res == 0 then
-        return "SELECT CAST('' AS VARCHAR(2000000) UTF8) AS ID, CAST('' AS VARCHAR(2000000) UTF8) AS TEXT, CAST(0 AS DOUBLE) AS SCORE, CAST('' AS VARCHAR(2000000) UTF8) AS QUERY FROM DUAL WHERE FALSE"
-    end
-    local rows, q = {}, esc(qtext)
-    for _, pt in ipairs(res) do
-        local p = pt.payload or {}
-        rows[#rows+1] = ("(CAST('%s' AS VARCHAR(2000000) UTF8),CAST('%s' AS VARCHAR(2000000) UTF8),CAST(%s AS DOUBLE),CAST('%s' AS VARCHAR(2000000) UTF8))"):format(
-            esc(tostring(p._original_id or pt.id or "")),
-            esc(tostring(p.text or "")),
-            tostring(pt.score or 0),
-            q
-        )
-    end
-    return "SELECT * FROM VALUES " .. table.concat(rows, ",") .. " AS t(ID,TEXT,SCORE,QUERY)"
 end
 
 local function props_of(req) return ((req.schemaMetadataInfo or {}).properties or {}) end
+
+local REMOVED_PROPS = {
+    OLLAMA_URL = "OLLAMA_URL is no longer supported — the query path now embeds in-database via ADAPTER.SEARCH_QDRANT_LOCAL (no Ollama process is required). Drop and re-create the virtual schema without OLLAMA_URL after running scripts/install_all.sql.",
+}
+
 local function check(p)
+    for key, msg in pairs(REMOVED_PROPS) do
+        if p[key] and p[key] ~= "" then error(msg) end
+    end
     assert(p.CONNECTION_NAME and p.CONNECTION_NAME ~= "", "Missing CONNECTION_NAME")
     assert(p.QDRANT_MODEL and p.QDRANT_MODEL ~= "", "Missing QDRANT_MODEL")
 end
@@ -304,6 +249,9 @@ function adapter_call(request_json)
     elseif t == "setproperties" then
         local old = props_of(req)
         local new = req.properties or {}
+        for key, msg in pairs(REMOVED_PROPS) do
+            if new[key] and new[key] ~= "" then error(msg) end
+        end
         local m = {}
         for k, v in pairs(old) do m[k] = v end
         for k, v in pairs(new) do if v == "" then m[k] = nil else m[k] = v end end
@@ -327,12 +275,9 @@ end
 
 
 -- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ STEP 4: Deploy Python UDFs for data ingestion                            │
+-- │ STEP 5: CREATE_QDRANT_COLLECTION — create a Qdrant collection             │
 -- └───────────────────────────────────────────────────────────────────────────┘
--- These UDFs let you create Qdrant collections and ingest data from Exasol
--- tables — all from SQL. No pip packages required (Python stdlib only).
 
--- 4a. CREATE_QDRANT_COLLECTION — Creates a Qdrant collection
 CREATE OR REPLACE PYTHON3 SCALAR SCRIPT ADAPTER.CREATE_QDRANT_COLLECTION(
     host        VARCHAR(255),
     port        INTEGER,
@@ -358,6 +303,7 @@ _MODEL_DIMENSIONS = {
     "paraphrase-MiniLM-L6-v2":   384,
     "multi-qa-MiniLM-L6-cos-v1": 384,
     "nomic-embed-text":          768,
+    "nomic-embed-text-v1.5":     768,
 }
 _VALID_DISTANCES = {"Cosine", "Dot", "Euclid", "Manhattan"}
 
@@ -413,386 +359,370 @@ def run(ctx):
     return "created: " + collection
 /
 
--- 4b. EMBED_AND_PUSH — Embeds text via Ollama/OpenAI and upserts into Qdrant
---
--- ╔══════════════════════════════════════════════════════════════════════════╗
--- ║  SECURITY WARNING: This UDF is DEPRECATED. Use EMBED_AND_PUSH_V2.     ║
--- ║                                                                        ║
--- ║  This UDF accepts API keys (qdrant_api_key, embedding_key) as plain-   ║
--- ║  text SQL parameters. These values appear VERBATIM in Exasol's audit   ║
--- ║  log (EXA_DBA_AUDIT_SQL). Anyone with SELECT access to audit tables    ║
--- ║  can harvest your credentials.                                         ║
--- ║                                                                        ║
--- ║  EMBED_AND_PUSH_V2 (Step 4d below) reads credentials from a           ║
--- ║  CONNECTION object, where passwords are redacted as <SECRET> in        ║
--- ║  audit logs. Always prefer V2 for any environment with API keys.       ║
--- ╚══════════════════════════════════════════════════════════════════════════╝
---
--- Parameters:
---   id             — Unique row identifier (stored as _original_id in Qdrant)
---   text_col       — Text to embed (tip: concatenate multiple columns)
---   qdrant_host    — Qdrant hostname/IP
---   qdrant_port    — Qdrant port (usually 6333)
---   qdrant_api_key — Qdrant API key ('' for no auth) [EXPOSED IN AUDIT LOGS]
---   collection     — Target Qdrant collection name
---   provider       — 'ollama' or 'openai'
---   embedding_key  — Ollama URL (e.g. 'http://172.17.0.1:11434') or OpenAI API key [EXPOSED IN AUDIT LOGS]
---   model_name     — Embedding model name (e.g. 'nomic-embed-text')
---
--- IMPORTANT: Always add GROUP BY IPROC() at the end of your SELECT statement.
-CREATE OR REPLACE PYTHON3 SET SCRIPT ADAPTER.EMBED_AND_PUSH(
-    id             VARCHAR(255),
-    text_col       VARCHAR(65535),
-    qdrant_host    VARCHAR(255),
-    qdrant_port    INTEGER,
-    qdrant_api_key VARCHAR(512),
-    collection     VARCHAR(255),
-    provider       VARCHAR(32),
-    embedding_key  VARCHAR(512),
-    model_name     VARCHAR(255)
-)
-EMITS (partition_id INTEGER, upserted_count INTEGER)
-AS
-import json
-import time
-import uuid
-import urllib.request
-import urllib.error
-import hashlib
-import socket
 
-BATCH_SIZE = 100
-MAX_RETRIES = 3
-MAX_CHARS = 6000  # ~1500 tokens, safe for nomic-embed-text (2048 token limit)
+-- ┌───────────────────────────────────────────────────────────────────────────┐
+-- │ STEP 6: EMBED_AND_PUSH_LOCAL — in-process embedding ingest (SLC)         │
+-- └───────────────────────────────────────────────────────────────────────────┘
+-- Reads Qdrant config from CONNECTION (qdrant_url, optional qdrant_api_key).
+-- Embeds rows in-process via sentence-transformers + nomic-embed-text-v1.5.
+-- No external embedding service required.
 
-def _truncate(texts):
-    return [t[:MAX_CHARS] if t and len(t) > MAX_CHARS else (t or "") for t in texts]
-
-def _ollama_embed(texts, ollama_url, model):
-    url = ollama_url.rstrip("/") + "/api/embed"
-    payload = json.dumps({"model": model, "input": texts}).encode()
-    headers = {"Content-Type": "application/json"}
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            return data["embeddings"]
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return _ollama_embed_one_by_one(texts, ollama_url, model)
-        raise RuntimeError("Ollama HTTP " + str(e.code) + " from " + url + ": " + e.read().decode()) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError("Connection to Ollama at " + url + " failed: " + str(e.reason)) from e
-
-def _ollama_embed_one_by_one(texts, ollama_url, model):
-    url = ollama_url.rstrip("/") + "/api/embeddings"
-    headers = {"Content-Type": "application/json"}
-    vectors = []
-    for text in texts:
-        payload = json.dumps({"model": model, "prompt": text}).encode()
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode())
-                vectors.append(data["embedding"])
-        except urllib.error.HTTPError as e:
-            raise RuntimeError("Ollama HTTP " + str(e.code) + " from " + url + ": " + e.read().decode()) from e
-        except urllib.error.URLError as e:
-            raise RuntimeError("Connection to Ollama at " + url + " failed: " + str(e.reason)) from e
-    return vectors
-
-def _openai_embed(texts, api_key, model):
-    url = "https://api.openai.com/v1/embeddings"
-    payload = json.dumps({"input": texts, "model": model}).encode()
-    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + api_key}
-    delay = 1.0
-    for attempt in range(1, MAX_RETRIES + 1):
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode())
-                return [item["embedding"] for item in data["data"]]
-        except urllib.error.HTTPError as e:
-            status = e.code
-            body = e.read().decode()
-            if status == 429 and attempt < MAX_RETRIES:
-                time.sleep(delay); delay *= 2; continue
-            raise RuntimeError("OpenAI HTTP " + str(status) + " from " + url + ": " + body) from e
-        except urllib.error.URLError as e:
-            raise RuntimeError("Connection to OpenAI at " + url + " failed: " + str(e.reason)) from e
-    raise RuntimeError("OpenAI failed after " + str(MAX_RETRIES) + " attempts")
-
-def _text_to_uuid(text_id):
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(text_id)))
-
-def _qdrant_upsert(qdrant_url, collection, ids, texts, vectors, api_key):
-    points = [{"id": _text_to_uuid(i), "vector": {"text": v}, "payload": {"_original_id": i, "text": t}}
-              for i, t, v in zip(ids, texts, vectors)]
-    payload = json.dumps({"points": points}).encode()
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["api-key"] = api_key
-    req = urllib.request.Request(qdrant_url + "/collections/" + collection + "/points",
-                                  data=payload, headers=headers, method="PUT")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read().decode())
-            if result.get("status") != "ok":
-                raise RuntimeError("Qdrant non-ok: " + str(result))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("Qdrant HTTP " + str(e.code) + " from " + qdrant_url + ": " + e.read().decode()) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError("Connection to Qdrant at " + qdrant_url + " failed: " + str(e.reason)) from e
-
-def run(ctx):
-    qdrant_host    = ctx.qdrant_host
-    qdrant_port    = int(ctx.qdrant_port)
-    qdrant_api_key = ctx.qdrant_api_key or None
-    collection     = ctx.collection
-    provider       = ctx.provider.lower()
-    embedding_key  = ctx.embedding_key or ""
-    model_name     = ctx.model_name
-    qdrant_url     = "http://" + qdrant_host + ":" + str(qdrant_port)
-
-    if provider not in ("openai", "ollama"):
-        raise ValueError("provider must be 'ollama' or 'openai', got: " + provider)
-
-    all_ids, all_texts, skipped_nulls = [], [], 0
-    while True:
-        row_id   = ctx.id
-        row_text = ctx.text_col or ""
-        if row_id is None or row_id == "":
-            skipped_nulls += 1
-        else:
-            all_ids.append(row_id)
-            all_texts.append(row_text)
-        if not ctx.next():
-            break
-    if skipped_nulls > 0 and len(all_ids) == 0:
-        raise ValueError("All " + str(skipped_nulls) + " rows have NULL or empty IDs. Provide a non-empty ID column.")
-
-
-    total = 0
-    for i in range(0, len(all_ids), BATCH_SIZE):
-        batch_ids   = all_ids[i:i+BATCH_SIZE]
-        batch_texts = all_texts[i:i+BATCH_SIZE]
-
-        if provider == "ollama":
-            vectors = _ollama_embed(_truncate(batch_texts), embedding_key, model_name)
-        else:
-            vectors = _openai_embed(_truncate(batch_texts), embedding_key, model_name)
-
-        _qdrant_upsert(qdrant_url, collection, batch_ids, batch_texts, vectors, qdrant_api_key)
-        total += len(batch_ids)
-
-    partition_id = int(hashlib.md5(socket.gethostname().encode()).hexdigest(), 16) % 65536
-    ctx.emit(partition_id, total)
-/
-
-
--- 4c. EMBEDDING_CONNECTION — Stores infrastructure config for simplified UDF
---
--- The connection address stores a JSON config blob. The password field stores
--- the Qdrant API key (or '' for no auth). This keeps credentials out of SQL
--- text and out of EXA_DBA_AUDIT_SQL.
---
--- Required keys: qdrant_url, ollama_url, provider, model
--- Optional tuning keys:
---   batch_size  — Number of texts to embed per API call (default: 100)
---   max_chars   — Max characters per text before truncation (default: 6000, ~1500 tokens)
---
--- Update the JSON values below for your environment:
-CREATE OR REPLACE CONNECTION embedding_conn
-    TO '{"qdrant_url":"http://172.17.0.1:6333","ollama_url":"http://172.17.0.1:11434","provider":"ollama","model":"nomic-embed-text"}'
-    USER ''
-    IDENTIFIED BY '';
-
--- 4d. EMBED_AND_PUSH_V2 — Simplified 4-parameter version using CONNECTION
---
--- Usage:
---   SELECT ADAPTER.EMBED_AND_PUSH_V2(
---       'embedding_conn',                  -- connection name (stores all config)
---       'my_collection',                   -- target collection
---       CAST(id_col AS VARCHAR(255)),      -- unique ID
---       text_col                           -- text to embed
---   )
---   FROM my_schema.my_table
---   GROUP BY IPROC();  -- REQUIRED for SET UDFs
---
-CREATE OR REPLACE PYTHON3 SET SCRIPT ADAPTER.EMBED_AND_PUSH_V2(
-    connection_name VARCHAR(255),
-    collection      VARCHAR(255),
+CREATE OR REPLACE PYTHON3_QDRANT SET SCRIPT ADAPTER.EMBED_AND_PUSH_LOCAL(
+    connection_name VARCHAR(200),
+    collection      VARCHAR(200),
     id              VARCHAR(255),
-    text_col        VARCHAR(65535)
+    text_col        VARCHAR(2000000)
 )
 EMITS (partition_id INTEGER, upserted_count INTEGER)
 AS
-import json
-import time
-import uuid
-import urllib.request
-import urllib.error
-import hashlib
-import socket
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-BATCH_SIZE = 100
-MAX_RETRIES = 3
+import hashlib
+import json
+import socket
+import urllib.error
+import urllib.request
+import uuid
+
+from sentence_transformers import SentenceTransformer
+
+MODEL_NAME = "nomic-embed-text-v1.5"
+MODEL_PATH = "/buckets/bfsdefault/default/models/" + MODEL_NAME
+
+BATCH_SIZE = 64
 MAX_CHARS = 6000
 
-def _truncate(texts):
-    return [t[:MAX_CHARS] if t and len(t) > MAX_CHARS else (t or "") for t in texts]
+_model = SentenceTransformer(MODEL_PATH, device="cpu", trust_remote_code=True)
 
-def _ollama_embed(texts, ollama_url, model):
-    url = ollama_url.rstrip("/") + "/api/embed"
-    payload = json.dumps({"model": model, "input": texts}).encode()
-    headers = {"Content-Type": "application/json"}
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            return data["embeddings"]
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return _ollama_embed_one_by_one(texts, ollama_url, model)
-        raise RuntimeError("Ollama HTTP " + str(e.code) + " from " + url + ": " + e.read().decode()) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError("Connection to Ollama at " + url + " failed: " + str(e.reason)) from e
 
-def _ollama_embed_one_by_one(texts, ollama_url, model):
-    url = ollama_url.rstrip("/") + "/api/embeddings"
-    headers = {"Content-Type": "application/json"}
-    vectors = []
-    for text in texts:
-        payload = json.dumps({"model": model, "prompt": text}).encode()
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode())
-                vectors.append(data["embedding"])
-        except urllib.error.HTTPError as e:
-            raise RuntimeError("Ollama HTTP " + str(e.code) + " from " + url + ": " + e.read().decode()) from e
-        except urllib.error.URLError as e:
-            raise RuntimeError("Connection to Ollama at " + url + " failed: " + str(e.reason)) from e
-    return vectors
+def _truncate(text):
+    if not text:
+        return ""
+    return text[:MAX_CHARS] if len(text) > MAX_CHARS else text
 
-def _openai_embed(texts, api_key, model):
-    url = "https://api.openai.com/v1/embeddings"
-    payload = json.dumps({"input": texts, "model": model}).encode()
-    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + api_key}
-    delay = 1.0
-    for attempt in range(1, MAX_RETRIES + 1):
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode())
-                return [item["embedding"] for item in data["data"]]
-        except urllib.error.HTTPError as e:
-            status = e.code
-            body = e.read().decode()
-            if status == 429 and attempt < MAX_RETRIES:
-                time.sleep(delay); delay *= 2; continue
-            raise RuntimeError("OpenAI HTTP " + str(status) + " from " + url + ": " + body) from e
-        except urllib.error.URLError as e:
-            raise RuntimeError("Connection to OpenAI at " + url + " failed: " + str(e.reason)) from e
-    raise RuntimeError("OpenAI failed after " + str(MAX_RETRIES) + " attempts")
 
 def _text_to_uuid(text_id):
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(text_id)))
 
-def _qdrant_upsert(qdrant_url, collection, ids, texts, vectors, api_key):
-    points = [{"id": _text_to_uuid(i), "vector": {"text": v}, "payload": {"_original_id": i, "text": t}}
-              for i, t, v in zip(ids, texts, vectors)]
+
+def _qdrant_upsert(qdrant_url, api_key, collection, ids, texts, vectors):
+    points = [
+        {"id": _text_to_uuid(i), "vector": {"text": v},
+         "payload": {"_original_id": i, "text": t}}
+        for i, t, v in zip(ids, texts, vectors)
+    ]
     payload = json.dumps({"points": points}).encode()
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["api-key"] = api_key
-    req = urllib.request.Request(qdrant_url + "/collections/" + collection + "/points",
-                                  data=payload, headers=headers, method="PUT")
+    url = qdrant_url.rstrip("/") + "/collections/" + collection + "/points"
+    req = urllib.request.Request(url, data=payload, headers=headers, method="PUT")
     try:
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read().decode())
             if result.get("status") != "ok":
                 raise RuntimeError("Qdrant non-ok: " + str(result))
     except urllib.error.HTTPError as e:
-        raise RuntimeError("Qdrant HTTP " + str(e.code) + " from " + qdrant_url + ": " + e.read().decode()) from e
+        raise RuntimeError("Qdrant HTTP " + str(e.code) + " from " + url + ": " + e.read().decode()) from e
     except urllib.error.URLError as e:
-        raise RuntimeError("Connection to Qdrant at " + qdrant_url + " failed: " + str(e.reason)) from e
+        raise RuntimeError("Connection to Qdrant at " + url + " failed: " + str(e.reason)) from e
+
 
 def run(ctx):
-    # Read config from CONNECTION object
-    conn_name = ctx.connection_name
-    conn = exa.get_connection(conn_name)
+    conn = exa.get_connection(ctx.connection_name)
     config = json.loads(conn.address)
-
-    qdrant_url  = config.get("qdrant_url")
+    qdrant_url = config.get("qdrant_url")
     if not qdrant_url:
-        raise ValueError("CONNECTION config missing 'qdrant_url'. Set it to the Qdrant endpoint reachable from inside Exasol (e.g. 'http://172.17.0.1:6333').")
-    ollama_url  = config.get("ollama_url")
-    if not ollama_url:
-        raise ValueError("CONNECTION config missing 'ollama_url'. Set it to the Ollama endpoint reachable from inside Exasol (e.g. 'http://172.17.0.1:11434'). Do NOT use 'localhost'.")
-    provider    = config.get("provider", "ollama").lower()
-    model_name  = config.get("model", "nomic-embed-text")
-    api_key     = conn.password if conn.password else config.get("qdrant_api_key", "")
-    embedding_key = config.get("openai_api_key", "") if provider == "openai" else ollama_url
-
-    # Performance tuning knobs (configurable via CONNECTION JSON)
-    global BATCH_SIZE, MAX_CHARS
-    BATCH_SIZE = int(config.get("batch_size", BATCH_SIZE))
-    MAX_CHARS  = int(config.get("max_chars", MAX_CHARS))
-
+        raise ValueError("CONNECTION config missing 'qdrant_url'.")
+    qdrant_api_key = conn.password if conn.password else config.get("qdrant_api_key", "")
     collection = ctx.collection
 
-    if provider not in ("openai", "ollama"):
-        raise ValueError("provider must be 'ollama' or 'openai', got: " + provider)
-
-    all_ids, all_texts, skipped_nulls = [], [], 0
+    all_ids, all_texts, skipped = [], [], 0
     while True:
-        row_id   = ctx.id
+        row_id = ctx.id
         row_text = ctx.text_col or ""
-        if row_id is None or row_id == "":
-            skipped_nulls += 1
+        if row_id is None or row_id == "" or row_text == "":
+            skipped += 1
         else:
             all_ids.append(row_id)
-            all_texts.append(row_text)
+            all_texts.append(_truncate(row_text))
         if not ctx.next():
             break
-    if skipped_nulls > 0 and len(all_ids) == 0:
-        raise ValueError("All " + str(skipped_nulls) + " rows have NULL or empty IDs.")
+
+    if skipped > 0 and len(all_ids) == 0:
+        raise ValueError("All " + str(skipped) + " rows had NULL/empty id or text.")
 
     total = 0
-    for i in range(0, len(all_ids), BATCH_SIZE):
-        batch_ids   = all_ids[i:i+BATCH_SIZE]
-        batch_texts = all_texts[i:i+BATCH_SIZE]
-
-        if provider == "ollama":
-            vectors = _ollama_embed(_truncate(batch_texts), embedding_key, model_name)
-        else:
-            vectors = _openai_embed(_truncate(batch_texts), embedding_key, model_name)
-
-        _qdrant_upsert(qdrant_url, collection, batch_ids, batch_texts, vectors, api_key)
+    for start in range(0, len(all_ids), BATCH_SIZE):
+        batch_ids = all_ids[start:start + BATCH_SIZE]
+        batch_texts = all_texts[start:start + BATCH_SIZE]
+        vectors = _model.encode(
+            batch_texts, batch_size=BATCH_SIZE,
+            normalize_embeddings=True, convert_to_numpy=True,
+        ).tolist()
+        _qdrant_upsert(qdrant_url, qdrant_api_key, collection, batch_ids, batch_texts, vectors)
         total += len(batch_ids)
 
-    partition_id = int(hashlib.md5(socket.gethostname().encode()).hexdigest(), 16) % 65536
+    partition_id = int(hashlib.md5(socket.gethostname().encode()).hexdigest()[:16], 16) % 65536
     ctx.emit(partition_id, total)
 /
 
 
--- 4e. PREFLIGHT_CHECK — Verify Qdrant + Ollama connectivity before deploying
---
--- Usage:
---   SELECT ADAPTER.PREFLIGHT_CHECK('http://172.17.0.1:6333', 'http://172.17.0.1:11434', 'nomic-embed-text');
---
--- Returns a structured pass/fail report as a single VARCHAR value.
-CREATE OR REPLACE PYTHON3 SCALAR SCRIPT ADAPTER.PREFLIGHT_CHECK(
-    qdrant_url  VARCHAR(512),
-    ollama_url  VARCHAR(512),
-    model_name  VARCHAR(255)
+-- ┌───────────────────────────────────────────────────────────────────────────┐
+-- │ STEP 7: EMBED_TEXT — scalar in-process embedding for the query path       │
+-- └───────────────────────────────────────────────────────────────────────────┘
+-- Returns a JSON-encoded 768-float vector for the input text. Called by the
+-- Lua adapter via SQL (SELECT ADAPTER.EMBED_TEXT(?)) at query time.
+-- Bit-for-bit parity with EMBED_AND_PUSH_LOCAL on the same SLC + model.
+
+CREATE OR REPLACE PYTHON3_QDRANT SCALAR SCRIPT ADAPTER.EMBED_TEXT(
+    text VARCHAR(2000000)
 )
 RETURNS VARCHAR(2000000)
 AS
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import json
+
+from sentence_transformers import SentenceTransformer
+
+MODEL_NAME = "nomic-embed-text-v1.5"
+MODEL_PATH = "/buckets/bfsdefault/default/models/" + MODEL_NAME
+
+MAX_CHARS = 6000
+
+_model = SentenceTransformer(MODEL_PATH, device="cpu", trust_remote_code=True)
+
+
+def _truncate(text):
+    return text[:MAX_CHARS] if len(text) > MAX_CHARS else text
+
+
+def run(ctx):
+    text = ctx.text
+    if text is None or text == "":
+        return None
+    vector = _model.encode(
+        _truncate(text),
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    return json.dumps(vector.tolist())
+/
+
+
+-- ┌───────────────────────────────────────────────────────────────────────────┐
+-- │ STEP 7b: SEARCH_QDRANT_LOCAL — embed + Qdrant hybrid search (SET UDF)     │
+-- └───────────────────────────────────────────────────────────────────────────┘
+-- Owns the entire query path. The Lua adapter generates SQL that calls this
+-- UDF; the UDF embeds the query text, runs Qdrant hybrid search (vector +
+-- per-keyword RRF fusion), and emits one row per hit. Reads Qdrant config
+-- from the same CONNECTION the virtual schema uses (accepts plain URL or
+-- JSON {"qdrant_url":"..."}).
+--
+-- This UDF exists because Exasol forbids exa.pquery_no_preprocessing during
+-- virtual schema pushdown, so the adapter cannot run SQL or HTTP itself
+-- there — all query-time work happens here.
+
+CREATE OR REPLACE PYTHON3_QDRANT SET SCRIPT ADAPTER.SEARCH_QDRANT_LOCAL(
+    connection_name VARCHAR(200),
+    collection      VARCHAR(200),
+    query_text      VARCHAR(2000000),
+    result_limit    INTEGER
+)
+EMITS (
+    result_id    VARCHAR(2000000) UTF8,
+    result_text  VARCHAR(2000000) UTF8,
+    result_score DOUBLE,
+    result_query VARCHAR(2000000) UTF8
+)
+AS
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import json
+import re
+import urllib.error
+import urllib.request
+
+from sentence_transformers import SentenceTransformer
+
+MODEL_NAME = "nomic-embed-text-v1.5"
+MODEL_PATH = "/buckets/bfsdefault/default/models/" + MODEL_NAME
+
+MAX_CHARS = 6000
+MAX_KEYWORDS = 12
+
+_model = SentenceTransformer(MODEL_PATH, device="cpu", trust_remote_code=True)
+
+_STOPWORDS = frozenset({
+    "a","an","the","and","or","but","not","no","nor","so","yet",
+    "is","am","are","was","were","be","been","being",
+    "has","have","had","do","does","did","will","would","shall","should",
+    "can","could","may","might","must",
+    "in","on","at","to","for","of","by","from","with","about","between",
+    "through","during","before","after","above","below","up","down",
+    "out","off","over","under","into",
+    "i","me","my","we","us","our","you","your","he","him","his",
+    "she","her","it","its","they","them","their",
+    "this","that","these","those","what","which","who","whom","how",
+    "when","where","why","if","then","than","as","while",
+    "all","each","every","both","few","more","most","some","any","such",
+    "very","just","also","only","too","own","same","other",
+})
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _truncate(text):
+    return text[:MAX_CHARS] if len(text) > MAX_CHARS else text
+
+
+def extract_keywords(text):
+    seen, result, prev = set(), [], None
+    for raw in _TOKEN_RE.findall(text or ""):
+        word = raw.lower()
+        if len(word) >= 2 and word not in _STOPWORDS and word not in seen:
+            seen.add(word); result.append(word)
+            if prev is not None:
+                compound = prev + word
+                if compound not in seen:
+                    seen.add(compound); result.append(compound)
+            prev = word
+        else:
+            prev = None
+    return result[:MAX_KEYWORDS]
+
+
+def _parse_connection(conn):
+    address = (conn.address or "").strip()
+    api_key = conn.password or ""
+    if address.startswith("{"):
+        try:
+            cfg = json.loads(address)
+            qdrant_url = cfg.get("qdrant_url", "")
+            if not api_key:
+                api_key = cfg.get("qdrant_api_key", "")
+        except (ValueError, json.JSONDecodeError):
+            qdrant_url = address
+    else:
+        qdrant_url = address
+    if not qdrant_url:
+        raise ValueError("CONNECTION address is empty or missing 'qdrant_url'.")
+    return qdrant_url.rstrip("/"), api_key
+
+
+def _build_vector_body(vector, limit):
+    return {"query": vector, "using": "text", "limit": limit, "with_payload": True}
+
+
+def _build_hybrid_body(vector, keywords, limit):
+    vector_limit = max(limit * 10, 50)
+    keyword_limit = max(limit * 4, 20)
+    prefetch = [{"query": vector, "using": "text", "limit": vector_limit}]
+    for kw in keywords:
+        prefetch.append({
+            "query": vector, "using": "text", "limit": keyword_limit,
+            "filter": {"must": [{"key": "text", "match": {"text": kw}}]},
+        })
+    return {"prefetch": prefetch, "query": {"fusion": "rrf"},
+            "limit": limit, "with_payload": True}
+
+
+def _qdrant_query(qdrant_url, api_key, collection, body):
+    url = qdrant_url + "/collections/" + collection + "/points/query"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["api-key"] = api_key
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("Qdrant HTTP " + str(e.code) + " from " + url + ": " + e.read().decode()) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError("Connection to Qdrant at " + url + " failed: " + str(e.reason)) from e
+
+
+def run(ctx):
+    conn = exa.get_connection(ctx.connection_name)
+    qdrant_url, api_key = _parse_connection(conn)
+    collection = ctx.collection
+    query_text = ctx.query_text
+    try:
+        result_limit = int(ctx.result_limit) if ctx.result_limit is not None else 10
+    except (TypeError, ValueError):
+        result_limit = 10
+
+    if query_text is None or query_text == "":
+        return
+
+    vector = _model.encode(_truncate(query_text), normalize_embeddings=True,
+                           convert_to_numpy=True).tolist()
+    keywords = extract_keywords(query_text)
+    body = _build_hybrid_body(vector, keywords, result_limit) if keywords \
+        else _build_vector_body(vector, result_limit)
+
+    response = _qdrant_query(qdrant_url, api_key, collection, body)
+    points = (response.get("result") or {}).get("points") or []
+
+    for pt in points:
+        payload = pt.get("payload") or {}
+        rid = payload.get("_original_id")
+        if rid is None:
+            rid = pt.get("id", "")
+        rtext = payload.get("text", "")
+        rscore = pt.get("score") or 0.0
+        ctx.emit(str(rid), str(rtext), float(rscore), query_text)
+/
+
+
+-- ┌───────────────────────────────────────────────────────────────────────────┐
+-- │ STEP 8: PREFLIGHT_CHECK — verify Qdrant + SLC/model round-trip            │
+-- └───────────────────────────────────────────────────────────────────────────┘
+-- Single argument now: only Qdrant URL. The embedding side is verified by
+-- loading the SLC's SentenceTransformer and encoding 'preflight' directly —
+-- this exercises exactly the same code path EMBED_TEXT and EMBED_AND_PUSH_LOCAL
+-- use, so a PASS here means both query-time and ingest-time embedding are
+-- working.
+--
+-- Usage:
+--   SELECT ADAPTER.PREFLIGHT_CHECK('http://172.17.0.1:6333');
+
+CREATE OR REPLACE PYTHON3_QDRANT SCALAR SCRIPT ADAPTER.PREFLIGHT_CHECK(
+    qdrant_url  VARCHAR(512)
+)
+RETURNS VARCHAR(2000000)
+AS
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import json
 import urllib.request
 import urllib.error
+
+MODEL_NAME = "nomic-embed-text-v1.5"
+MODEL_PATH = "/buckets/bfsdefault/default/models/" + MODEL_NAME
+
+_model = None
+_model_load_error = None
+try:
+    from sentence_transformers import SentenceTransformer
+    _model = SentenceTransformer(MODEL_PATH, device="cpu", trust_remote_code=True)
+except Exception as e:
+    _model_load_error = str(e)
+
 
 def _http_get(url, timeout=10):
     req = urllib.request.Request(url, method="GET")
@@ -806,27 +736,11 @@ def _http_get(url, timeout=10):
     except Exception as e:
         return None, str(e)
 
-def _http_post(url, payload, timeout=30):
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode()), None
-    except urllib.error.HTTPError as e:
-        return None, "HTTP " + str(e.code) + ": " + e.read().decode()
-    except urllib.error.URLError as e:
-        return None, "Connection failed: " + str(e.reason)
-    except Exception as e:
-        return None, str(e)
 
 def run(ctx):
     if not ctx.qdrant_url or ctx.qdrant_url.strip() == "":
-        raise ValueError("qdrant_url is required. Use the IP reachable from inside Exasol (e.g. '172.17.0.1'). Do NOT use 'localhost'.")
-    if not ctx.ollama_url or ctx.ollama_url.strip() == "":
-        raise ValueError("ollama_url is required. Use the IP reachable from inside Exasol (e.g. 'http://172.17.0.1:11434'). Do NOT use 'localhost'.")
+        raise ValueError("qdrant_url is required. Use the IP reachable from inside Exasol (e.g. 'http://172.17.0.1:6333'). Do NOT use 'localhost'.")
     qdrant_url = ctx.qdrant_url.rstrip("/")
-    ollama_url = ctx.ollama_url.rstrip("/")
-    model_name = ctx.model_name or "nomic-embed-text"
 
     checks = []
     all_pass = True
@@ -840,34 +754,17 @@ def run(ctx):
         collections = [c["name"] for c in data.get("result", {}).get("collections", [])]
         checks.append("[PASS] Qdrant: reachable, " + str(len(collections)) + " collection(s): " + ", ".join(collections[:5]))
 
-    # Check 2: Ollama connectivity
-    data, err = _http_get(ollama_url + "/api/tags")
-    if err:
-        checks.append("[FAIL] Ollama (" + ollama_url + "): " + err)
+    # Check 2: SLC + model load + embedding round-trip
+    if _model is None:
+        checks.append("[FAIL] sentence-transformers + " + MODEL_NAME + " load: " + str(_model_load_error))
         all_pass = False
     else:
-        models = [m["name"] for m in data.get("models", [])]
-        checks.append("[PASS] Ollama: reachable, models: " + ", ".join(models[:5]))
-
-        # Check 3: Model availability
-        model_found = any(model_name in m for m in models)
-        if model_found:
-            checks.append("[PASS] Model '" + model_name + "': available")
-        else:
-            checks.append("[FAIL] Model '" + model_name + "': NOT found. Available: " + ", ".join(models))
+        try:
+            vec = _model.encode("preflight", normalize_embeddings=True, convert_to_numpy=True)
+            checks.append("[PASS] Embedding round-trip: " + str(len(vec.tolist())) + "-dim vector from " + MODEL_NAME)
+        except Exception as e:
+            checks.append("[FAIL] Embedding round-trip: " + str(e))
             all_pass = False
-
-    # Check 4: Embedding round-trip
-    data, err = _http_post(ollama_url + "/api/embeddings", {"model": model_name, "prompt": "preflight test"})
-    if err:
-        checks.append("[FAIL] Embedding test: " + err)
-        all_pass = False
-    elif data and data.get("embedding"):
-        dim = len(data["embedding"])
-        checks.append("[PASS] Embedding test: " + str(dim) + "-dimensional vector returned")
-    else:
-        checks.append("[FAIL] Embedding test: no embedding in response")
-        all_pass = False
 
     # Build report
     status = "ALL CHECKS PASSED" if all_pass else "SOME CHECKS FAILED"
@@ -876,50 +773,39 @@ def run(ctx):
         report += c + "\n"
     if not all_pass:
         report += "\nTroubleshooting:\n"
-        report += "- Ensure Qdrant and Ollama are running and accessible from inside Exasol\n"
-        report += "- Docker bridge IP is typically 172.17.0.1 (find with: docker exec <exasol> ip route show default)\n"
-        report += "- Pull missing models with: docker exec ollama ollama pull " + model_name + "\n"
+        report += "- Ensure Qdrant is running and reachable from inside Exasol (typically 172.17.0.1)\n"
+        report += "- Ensure the qdrant-embed SLC and nomic-embed-text-v1.5 model are uploaded to BucketFS\n"
+        report += "  (run ./scripts/build_and_upload_slc.sh) and PYTHON3_QDRANT is registered\n"
+        report += "- Re-run scripts/install_all.sql to (re)install the EMBED_TEXT UDF\n"
 
     return report
 /
 
 
 -- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ STEP 5: Create virtual schema                                            │
+-- │ STEP 9: Create virtual schema                                            │
 -- └───────────────────────────────────────────────────────────────────────────┘
 -- This maps all Qdrant collections as queryable Exasol tables.
 -- After creating, each collection appears as a table with columns:
 --   ID (VARCHAR), TEXT (VARCHAR), SCORE (DOUBLE), QUERY (VARCHAR)
-
+--
+-- Note: OLLAMA_URL is no longer a valid property. The query path embeds in
+-- the database via ADAPTER.EMBED_TEXT — no external embedding service.
+--
 -- DROP + CREATE is used instead of IF NOT EXISTS because Exasol cannot
--- update virtual schema properties in-place. This is safe — dropping a
--- virtual schema does NOT delete Qdrant data (it is just a metadata mapping).
+-- update virtual schema properties in-place. Dropping a virtual schema does
+-- NOT delete Qdrant data — it is just a metadata mapping.
 --
--- IMPORTANT: We use DROP FORCE (not CASCADE) for two reasons:
---   1. CASCADE can destroy the ADAPTER schema (scripts, connections, everything)
---   2. Regular DROP sometimes leaves ghost metadata that blocks the next CREATE
---      (Exasol platform bug — session-level metadata caching). DROP FORCE
---      resolves this reliably.
---
--- If CREATE still fails with "already exists" after DROP FORCE, disconnect
--- and reconnect your SQL session, then re-run from this point.
+-- DROP FORCE (not CASCADE) is intentional: CASCADE can destroy the ADAPTER
+-- schema (scripts, connections, everything). DROP FORCE also resolves the
+-- "ghost metadata" caching bug that sometimes blocks the next CREATE.
+
 DROP FORCE VIRTUAL SCHEMA IF EXISTS vector_schema;
 
 CREATE VIRTUAL SCHEMA vector_schema
     USING ADAPTER.VECTOR_SCHEMA_ADAPTER
     WITH CONNECTION_NAME = 'qdrant_conn'
-         QDRANT_MODEL    = 'nomic-embed-text'
-         OLLAMA_URL      = 'http://172.17.0.1:11434';
-
-
--- ┌───────────────────────────────────────────────────────────────────────────┐
--- │ NOTE: No explicit REFRESH needed                                         │
--- └───────────────────────────────────────────────────────────────────────────┘
--- CREATE VIRTUAL SCHEMA already performs an implicit refresh. Adding an
--- explicit ALTER VIRTUAL SCHEMA REFRESH here is redundant and can trigger
--- the ghost-state metadata caching bug on re-runs. If you need to refresh
--- later (e.g., after adding new Qdrant collections), run:
---   ALTER VIRTUAL SCHEMA vector_schema REFRESH;
+         QDRANT_MODEL    = 'nomic-embed-text-v1.5';
 
 
 -- =============================================================================
@@ -927,6 +813,10 @@ CREATE VIRTUAL SCHEMA vector_schema
 -- =============================================================================
 --
 -- USAGE EXAMPLES:
+--
+-- ── Preflight check ──────────────────────────────────────────────────────────
+--
+--   SELECT ADAPTER.PREFLIGHT_CHECK('http://172.17.0.1:6333');
 --
 -- ── Semantic Search ──────────────────────────────────────────────────────────
 --
@@ -941,16 +831,13 @@ CREATE VIRTUAL SCHEMA vector_schema
 --       '172.17.0.1', 6333, '',         -- Qdrant host, port, API key
 --       'my_collection',                 -- collection name
 --       768, 'Cosine',                   -- vector size, distance metric
---       'nomic-embed-text'               -- model (auto-detects dimensions)
+--       'nomic-embed-text-v1.5'          -- model (auto-detects dimensions)
 --   );
 --
--- ── Ingest Data from an Exasol Table (V2 — recommended) ─────────────────────
+-- ── Ingest data via in-process SLC embedding (CONNECTION-driven) ────────────
 --
---   V2 reads config from a CONNECTION object. Credentials are stored in the
---   CONNECTION password field, which Exasol redacts as <SECRET> in audit logs.
---
---   SELECT ADAPTER.EMBED_AND_PUSH_V2(
---       'embedding_conn',                 -- connection name (stores all config)
+--   SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
+--       'embedding_conn',                 -- connection name
 --       'my_collection',                  -- target collection
 --       CAST(row_number AS VARCHAR(36)),  -- unique ID column
 --       "name" || ' in ' || "city"        -- text to embed (concatenate columns)
@@ -960,23 +847,6 @@ CREATE VIRTUAL SCHEMA vector_schema
 --
 --   -- Then refresh to see the new collection:
 --   ALTER VIRTUAL SCHEMA vector_schema REFRESH;
---
--- ── Ingest Data (V1 — legacy, NOT recommended) ─────────────────────────────
---
---   WARNING: V1 passes API keys as plain-text SQL parameters. These appear
---   verbatim in EXA_DBA_AUDIT_SQL. Use V2 above instead.
---
---   SELECT ADAPTER.EMBED_AND_PUSH(
---       CAST(row_number AS VARCHAR(36)), -- unique ID column
---       "name" || ' in ' || "city",      -- text to embed (concatenate columns)
---       '172.17.0.1', 6333, '',          -- Qdrant host, port, API key
---       'my_collection',                  -- target collection
---       'ollama',                         -- provider ('ollama' or 'openai')
---       'http://<OLLAMA_IP>:11434',       -- Ollama URL
---       'nomic-embed-text'                -- embedding model
---   )
---   FROM my_schema.my_table
---   GROUP BY IPROC();
 --
 -- ── Hello World (quick test) ─────────────────────────────────────────────────
 --
@@ -993,7 +863,7 @@ CREATE VIRTUAL SCHEMA vector_schema
 --
 --   SELECT ADAPTER.CREATE_QDRANT_COLLECTION('172.17.0.1', 6333, '', 'hello_world', 768, 'Cosine', '');
 --
---   SELECT ADAPTER.EMBED_AND_PUSH_V2(
+--   SELECT ADAPTER.EMBED_AND_PUSH_LOCAL(
 --       'embedding_conn', 'hello_world',
 --       CAST(ID AS VARCHAR(36)), DOC
 --   ) FROM ADAPTER.hello_world GROUP BY IPROC();

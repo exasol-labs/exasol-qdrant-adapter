@@ -1,8 +1,18 @@
 # Lua Port Specification — Exasol Qdrant Vector Search Adapter
 
-**Status:** Planned
+**Status:** Historical (port complete; superseded by current `src/lua/` and OpenSpec changes).
 **Goal:** Replace the Java Virtual Schema adapter with a Lua adapter to eliminate BucketFS dependency and reduce startup latency.
 **Skill reference:** `docs/lua-port/SKILL.md`
+
+> This document captures the original Lua-port plan, including the Ollama-based
+> query path that was the design at port time. The query path has since moved
+> in-database — first to `ADAPTER.EMBED_TEXT` (scalar), and currently to
+> `ADAPTER.SEARCH_QDRANT_LOCAL` (a SET UDF that owns embedding + Qdrant hybrid
+> search in one call). `OLLAMA_URL` is no longer a recognised virtual-schema
+> property; the adapter rejects it with a migration error. Treat the property
+> table, HTTP-call sections, and example `CREATE VIRTUAL SCHEMA` below as
+> **historical, not runnable today**. Refer to `README.md` and
+> `docs/local-embeddings.md` for the current state.
 
 ---
 
@@ -86,7 +96,11 @@ dist/
 
 ---
 
-## Adapter Properties (unchanged from Java)
+## Adapter Properties (historical — pre-local-embeddings)
+
+> ⚠️ **Historical only.** The current property set is documented in `README.md`.
+> `OLLAMA_URL` is no longer accepted; the adapter rejects it with a migration
+> error. `QDRANT_MODEL` is now informational rather than an Ollama model name.
 
 | Property | Required | Default | Description |
 |---|---|---|---|
@@ -153,7 +167,12 @@ FROM DUAL WHERE FALSE
 
 ---
 
-## Deployment (target experience)
+## Deployment (target experience — historical)
+
+> ⚠️ **The example below WILL FAIL on the current adapter** — `OLLAMA_URL` is
+> rejected with a migration error. Kept here only to show the original
+> port-time deployment shape. For the current deployment flow, see
+> `docs/deployment.md` and `scripts/install_all.sql`.
 
 ```sql
 -- 1. Create connection (same as today)
@@ -166,7 +185,7 @@ CREATE OR REPLACE LUA ADAPTER SCRIPT ADAPTER.VECTOR_SCHEMA_ADAPTER AS
   -- paste contents of dist/adapter.lua here
 /
 
--- 3. Create virtual schema (same as today)
+-- 3. Create virtual schema (HISTORICAL — current adapter rejects OLLAMA_URL)
 CREATE VIRTUAL SCHEMA vector_schema
   USING ADAPTER.VECTOR_SCHEMA_ADAPTER
   WITH CONNECTION_NAME = 'qdrant_conn'
